@@ -121,7 +121,7 @@ Divergence is insufficient for high-conviction overnight momentum."""
         send_telegram(msg)
 
 def run_30m_exit_scan():
-    """Calculates 30m Heikin-Ashi trend reversal rules for open positions."""
+    """Executes every 30 mins: Sends 30m candle status update & checks exit conditions."""
     df_30m = yf.download("^NSEI", period="5d", interval="30m", progress=False)
     if df_30m.empty:
         return
@@ -129,6 +129,7 @@ def run_30m_exit_scan():
     if isinstance(df_30m.columns, pd.MultiIndex):
         df_30m.columns = df_30m.columns.get_level_values(0)
 
+    # Compute 30-Minute Heikin-Ashi candles
     ha_df = df_30m.copy()
     ha_df['HA_Close'] = (df_30m['Open'] + df_30m['High'] + df_30m['Low'] + df_30m['Close']) / 4.0
     
@@ -146,8 +147,9 @@ def run_30m_exit_scan():
     prev_candle = ha_df.iloc[-2]
 
     now_time = datetime.datetime.now(IST).strftime("%H:%M IST")
+    candle_color = "🔴 RED" if latest_candle['Is_Red'] else "🟢 GREEN"
     
-    # 3:13 PM Hard Cutoff Check
+    # 1. 3:13 PM Hard Cutoff Check
     if datetime.datetime.now(IST).hour == 15 and datetime.datetime.now(IST).minute >= 13:
         msg = f"""⏰ <b>TIME CUTOFF REACHED (3:13 PM IST)</b>
 ------------------------------------
@@ -159,7 +161,7 @@ Do not carry this position into a second night."""
         send_telegram(msg)
         return
 
-    # Check for Red Candle Low Break (CE Exit)
+    # 2. Check for Specific Exit Triggers
     if prev_candle['Is_Red'] and latest_candle['Close'] < prev_candle['HA_Low']:
         msg = f"""🛑 <b>CALL (CE) EXIT SIGNAL TRIGGERED</b>
 ------------------------------------
@@ -173,7 +175,6 @@ Reason: 30-min Red Heikin-Ashi Low Broken
 ⚡ <b>ACTION REQUIRED:</b> Exit ALL open Call (CE) lots!"""
         send_telegram(msg)
 
-    # Check for Green Candle High Break (PE Exit)
     elif prev_candle['Is_Green'] and latest_candle['Close'] > prev_candle['HA_High']:
         msg = f"""🛑 <b>PUT (PE) EXIT SIGNAL TRIGGERED</b>
 ------------------------------------
@@ -185,6 +186,22 @@ Reason: 30-min Green Heikin-Ashi High Broken
 • Current Spot Price: {latest_candle['Close']:.2f} (Broken 👆)
 
 ⚡ <b>ACTION REQUIRED:</b> Exit ALL open Put (PE) lots!"""
+        send_telegram(msg)
+
+    else:
+        # 3. Regular 30-Minute Status Update (Sent every 30 mins)
+        msg = f"""⏱️ <b>30-MIN MARKET STATUS UPDATE</b>
+------------------------------------
+Time: {now_time}
+Asset: NIFTY 50 (Spot)
+
+📊 <b>LATEST 30M CANDLE DATA</b>
+• Current Spot: {latest_candle['Close']:.2f}
+• HA Candle Color: {candle_color}
+• HA High: {latest_candle['HA_High']:.2f}
+• HA Low: {latest_candle['HA_Low']:.2f}
+
+ℹ️ Position Monitoring Active. No exit triggered yet."""
         send_telegram(msg)
 
 if __name__ == "__main__":
