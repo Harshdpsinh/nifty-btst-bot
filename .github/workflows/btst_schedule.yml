@@ -1,0 +1,41 @@
+name: Daily BTST Trading Engine
+
+on:
+  schedule:
+    # 3:20 PM IST is 9:50 AM UTC (Monday to Friday)
+    - cron: '50 9 * * 1-5'
+    # Check 30m exits every half hour during Indian market hours
+    - cron: '45 3,4,5,6,7,8,9 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-btst:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute 3:20 PM Entry Scanner
+        if: github.event.schedule == '50 9 * * 1-5' || github.event_name == 'workflow_dispatch'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python btst_engine.py entry
+
+      - name: Execute 30m Exit Scanner
+        if: github.event.schedule != '50 9 * * 1-5'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python btst_engine.py exit
