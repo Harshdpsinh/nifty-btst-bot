@@ -70,6 +70,14 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Switch data feeds from Settings -> Secrets and variables -> Actions
+          # -> Variables (DATA_PROVIDER=yahoo|angelone) — no code push needed.
+          # See providers.py for what each provider requires.
+          DATA_PROVIDER: ${{ vars.DATA_PROVIDER || 'yahoo' }}
+          ANGELONE_API_KEY: ${{ secrets.ANGELONE_API_KEY }}
+          ANGELONE_CLIENT_ID: ${{ secrets.ANGELONE_CLIENT_ID }}
+          ANGELONE_PASSWORD: ${{ secrets.ANGELONE_PASSWORD }}
+          ANGELONE_TOTP_SECRET: ${{ secrets.ANGELONE_TOTP_SECRET }}
           MODE: ${{ github.event.inputs.mode || 'auto' }}
           FORCE: ${{ github.event.inputs.force == 'true' && '--force' || '' }}
         run: python btst_engine.py "$MODE" $FORCE

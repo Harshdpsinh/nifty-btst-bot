@@ -30,7 +30,8 @@ All strategy constants live in the `STRATEGY` block at the top of
 
 ## Setup
 
-Add two repository secrets (Settings → Secrets and variables → Actions):
+Add two repository secrets (Settings → Secrets and variables → Actions →
+Secrets):
 
 - `TELEGRAM_BOT_TOKEN` — from [@BotFather](https://t.me/BotFather)
 - `TELEGRAM_CHAT_ID` — your chat/channel ID
@@ -38,6 +39,31 @@ Add two repository secrets (Settings → Secrets and variables → Actions):
 Verify the plumbing end to end: Actions → *Daily BTST Trading Engine* → **Run
 workflow** → mode `selftest`. A message should arrive in Telegram within a
 minute. If it doesn't, the run log says exactly which half failed.
+
+## Data provider
+
+Market data is read through a swappable provider (`providers.py`), selected
+by the `DATA_PROVIDER` **repository variable** (Settings → Secrets and
+variables → Actions → **Variables**, not Secrets) — switching feeds never
+needs a code change or a push.
+
+| `DATA_PROVIDER` | Cost | Notes |
+| --- | --- | --- |
+| `yahoo` (default) | Free, no account | Unofficial, ~15 min delayed. Fine to explore the strategy; risky for the live entry decision since the divergence threshold is only 11 points. |
+| `angelone` | Free with an Angel One demat account | Official real-time NSE data via SmartAPI. **Stub only right now** — `AngelOneProvider` in `providers.py` raises `NotImplementedError` until credentials are supplied and its two data methods are filled in. |
+
+To activate `angelone`: enable the SmartAPI add-on on your Angel One account,
+generate an API key at https://smartapi.angelbroking.com, add
+`ANGELONE_API_KEY`, `ANGELONE_CLIENT_ID`, `ANGELONE_PASSWORD`,
+`ANGELONE_TOTP_SECRET` as repository **secrets**, then set the
+`DATA_PROVIDER` variable to `angelone`. The workflow already forwards all of
+these — see the `Run BTST engine` step in
+`.github/workflows/btst_schedule.yml`.
+
+Any other broker (Upstox, Fyers, Dhan, 5paisa, …) follows the same pattern:
+add a class to `providers.py` implementing `daily_bars()` and
+`intraday_bars()`, register it in `_PROVIDERS`, done. Nothing in
+`btst_engine.py` needs to change.
 
 ## Running it manually
 
