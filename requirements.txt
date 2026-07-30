@@ -1,5 +1,10 @@
-yfinance>=0.2.38
-pandas>=2.0.0
-numpy>=1.24.0
-requests>=2.31.0
-pytz>=2024.1
+# Pinned exactly. yfinance is the dependency most likely to break this bot,
+# and an unattended scheduled job must not pick up a breaking release on its
+# own. These are the versions verified working in CI on 2026-07-29.
+# To upgrade: bump here, run `python btst_engine.py selftest` via
+# workflow_dispatch, and only then leave it on the schedule.
+yfinance==1.5.2
+pandas==2.3.3
+numpy==2.2.6
+requests==2.34.2
+pytz==2026.3.post1
