@@ -141,9 +141,52 @@ This repo mitigates it two ways, but does not — cannot — fully solve it:
    will never tell you to buy something two hours late again.
 
 If you need the entry to actually land inside 3:21–3:28 PM every day, move the
-scheduler off GitHub Actions — a small always-on VPS with real cron, or any
-scheduler with an SLA, calling `python btst_engine.py entry`. The engine itself
-needs no changes for that.
+scheduler off GitHub Actions entirely — see the next section.
+
+## Running on your own server (Oracle Cloud, Raspberry Pi, etc.)
+
+GitHub Actions cron cannot be fixed — only worked around. `deploy/oracle_vm_setup.sh`
+sets the bot up on any Ubuntu/Debian box (Oracle Cloud's Always Free ARM VM,
+a Raspberry Pi, a spare laptop — anything left on during market hours) using
+real cron instead:
+
+```bash
+ssh your-vm
+curl -fsSL https://raw.githubusercontent.com/Harshdpsinh/nifty-btst-bot/main/deploy/oracle_vm_setup.sh | bash
+```
+
+This one-time script:
+- Sets the VM's timezone to IST, so cron entries mean what they look like —
+  no UTC conversion, unlike GitHub Actions.
+- Clones the repo, creates a venv, installs dependencies.
+- Creates `~/.btst.env` (chmod 600, **outside** the git working tree) with
+  empty placeholders for your secrets.
+- Creates `deploy/run_engine.sh`, which loads that env file and runs one
+  engine cycle.
+- Installs a crontab entry running it every 5 minutes, 9:00–15:35 IST,
+  Monday–Friday — real per-second cron, not a best-effort queue.
+
+After it finishes:
+
+```bash
+nano ~/.btst.env                              # fill in your real values
+~/nifty-btst-bot/deploy/run_engine.sh         # test it once by hand
+tail -30 ~/nifty-btst-bot/engine.log          # confirm it ran clean
+```
+
+Once a Telegram message arrives from that manual run, cron takes over
+automatically — nothing else to do. Re-running the setup script later (to
+pull code updates) is safe: it won't duplicate the crontab entry or touch
+your existing `.btst.env`.
+
+State (`~/.btst_state.json`) is kept outside the repo on purpose, so pulling
+a code update can never conflict with or clobber your current position.
+
+**Once this is confirmed working, disable the GitHub Actions schedule** so
+you don't get duplicated notifications from both places: Settings →
+Actions → the workflow → ⋯ → Disable workflow, or delete the `schedule:`
+block in `.github/workflows/btst_schedule.yml` and keep `workflow_dispatch:`
+for occasional manual runs (e.g. `selftest`).
 
 ## Cost
 
