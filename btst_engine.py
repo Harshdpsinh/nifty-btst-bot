@@ -10,6 +10,10 @@ therefore decides what to do from the *actual* IST clock rather than trusting
 the cron that woke it, keeps state between runs so redundant wake-ups are
 harmless, and refuses to emit a tradeable signal outside the entry window.
 
+Market data comes from a swappable provider (see providers.py) selected by
+the DATA_PROVIDER env var — switching feeds is a config change, not a code
+change. Everything below the STRATEGY block is provider-agnostic.
+
 Usage:
     python btst_engine.py auto        # decide from the IST clock (default)
     python btst_engine.py entry
@@ -30,12 +34,12 @@ import logging
 import os
 import pathlib
 import sys
-import time
 
 import pandas as pd
 import pytz
 import requests
-import yfinance as yf
+
+from providers import get_provider
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -54,12 +58,10 @@ AUTO_ENTRY_UNTIL = dt.time(20, 0)         # still report a *missed* window until
 EXIT_MONITOR_FROM = dt.time(9, 45)        # first 30m candle close
 EXIT_MONITOR_UNTIL = dt.time(15, 16)      # just past HARD_EXIT_TIME
 
-DAILY_PERIOD = "10d"
-INTRADAY_PERIOD = "5d"
-INTRADAY_INTERVAL = "30m"
+DAILY_LOOKBACK_DAYS = 10
+INTRADAY_LOOKBACK_DAYS = 5
+INTRADAY_INTERVAL_MIN = 30
 MAX_INTRADAY_STALENESS_MIN = 90      # data-freshness guard, not a strategy rule
-DOWNLOAD_RETRIES = 3
-RETRY_BACKOFF_SEC = 2
 REQUEST_TIMEOUT = 10
 TELEGRAM_MAX_CHARS = 4096
 
@@ -75,6 +77,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("btst")
+
+PROVIDER = get_provider()
+log.info("Data provider: %s", PROVIDER.name)
 
 _send_failures = 0
 
@@ -172,31 +177,10 @@ def save_state(state: dict) -> None:
 
 
 # ------------------------------ data ------------------------------
-
-
-def _download(period: str, interval: str) -> pd.DataFrame:
-    """Download OHLC with retries; flattens MultiIndex columns."""
-    last_err: Exception | None = None
-    for attempt in range(1, DOWNLOAD_RETRIES + 1):
-        try:
-            df = yf.download(
-                SYMBOL,
-                period=period,
-                interval=interval,
-                progress=False,
-                auto_adjust=False,
-            )
-            if df is not None and not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                return df
-            last_err = ValueError("Yahoo Finance returned an empty frame")
-        except Exception as e:  # network/parse errors from yfinance
-            last_err = e
-        log.warning("Download attempt %d/%d failed: %s", attempt, DOWNLOAD_RETRIES, last_err)
-        if attempt < DOWNLOAD_RETRIES:
-            time.sleep(RETRY_BACKOFF_SEC * attempt)
-    raise RuntimeError(f"Failed to fetch {SYMBOL} {interval} data: {last_err}")
+#
+# All feed access goes through PROVIDER (see providers.py). Nothing below
+# this point knows or cares whether bars came from Yahoo, a broker API, or
+# anything else — that's the point of the abstraction.
 
 
 def _last_timestamp_ist(df: pd.DataFrame) -> pd.Timestamp:
@@ -206,7 +190,7 @@ def _last_timestamp_ist(df: pd.DataFrame) -> pd.Timestamp:
 
 def get_live_daily_data() -> tuple[float, float]:
     """Return (live spot, forming daily Heikin-Ashi close)."""
-    df = _download(DAILY_PERIOD, "1d")
+    df = PROVIDER.daily_bars(SYMBOL, DAILY_LOOKBACK_DAYS)
 
     last_date = _last_timestamp_ist(df).date()
     today = _now().date()
@@ -227,7 +211,7 @@ def get_live_daily_data() -> tuple[float, float]:
 
 def calculate_30m_heikin_ashi() -> pd.DataFrame:
     """Build 30m Heikin-Ashi candles. Raises on empty/stale/insufficient data."""
-    df = _download(INTRADAY_PERIOD, INTRADAY_INTERVAL)
+    df = PROVIDER.intraday_bars(SYMBOL, INTRADAY_INTERVAL_MIN, INTRADAY_LOOKBACK_DAYS)
     if len(df) < 2:
         raise ValueError("Need at least two 30m candles to evaluate exits.")
 
@@ -561,6 +545,7 @@ def run_selftest(state: dict) -> None:
     """Verify credentials, clock and data feed, and prove Telegram delivery."""
     now = _now()
     log.info("IST now: %s (weekday=%s)", _stamp(now), now.strftime("%A"))
+    log.info("Data provider: %s", PROVIDER.name)
     log.info("TELEGRAM_BOT_TOKEN set: %s", bool(TELEGRAM_BOT_TOKEN))
     log.info("TELEGRAM_CHAT_ID set: %s", bool(TELEGRAM_CHAT_ID))
     log.info("State file: %s (exists=%s)", STATE_PATH, STATE_PATH.exists())
@@ -577,6 +562,7 @@ def run_selftest(state: dict) -> None:
     send_telegram(f"""✅ BTST SELFTEST
 Time: {_stamp(now)}
 
+• Data provider: {PROVIDER.name}
 • Telegram delivery: working (you are reading this)
 • Daily feed: {data_line}
 • Open position: {state.get('position') or 'none'}
