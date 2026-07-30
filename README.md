@@ -50,15 +50,34 @@ needs a code change or a push.
 | `DATA_PROVIDER` | Cost | Notes |
 | --- | --- | --- |
 | `yahoo` (default) | Free, no account | Unofficial, ~15 min delayed. Fine to explore the strategy; risky for the live entry decision since the divergence threshold is only 11 points. |
-| `angelone` | Free with an Angel One demat account | Official real-time NSE data via SmartAPI. **Stub only right now** — `AngelOneProvider` in `providers.py` raises `NotImplementedError` until credentials are supplied and its two data methods are filled in. |
+| `angelone` | Free with an Angel One demat account | Official real-time NSE data via SmartAPI's `getCandleData`. Implemented in `providers.py` — see below to activate. |
 
-To activate `angelone`: enable the SmartAPI add-on on your Angel One account,
-generate an API key at https://smartapi.angelbroking.com, add
-`ANGELONE_API_KEY`, `ANGELONE_CLIENT_ID`, `ANGELONE_PASSWORD`,
-`ANGELONE_TOTP_SECRET` as repository **secrets**, then set the
-`DATA_PROVIDER` variable to `angelone`. The workflow already forwards all of
-these — see the `Run BTST engine` step in
-`.github/workflows/btst_schedule.yml`.
+### Activating `angelone`
+
+1. Enable the SmartAPI add-on on your Angel One account and generate an API
+   key at https://smartapi.angelbroking.com. This also gives you a TOTP
+   secret for 2FA — save the secret itself, not a one-time code from it.
+2. Add these four as repository **secrets** (Settings → Secrets and
+   variables → Actions → Secrets): `ANGELONE_API_KEY`, `ANGELONE_CLIENT_ID`,
+   `ANGELONE_PASSWORD`, `ANGELONE_TOTP_SECRET`. The workflow already
+   forwards all of them — see the `Run BTST engine` step in
+   `.github/workflows/btst_schedule.yml`.
+3. Set the `DATA_PROVIDER` repository **variable** to `angelone`.
+4. Verify before trusting it for a real trade: Actions → *Daily BTST Trading
+   Engine* → **Run workflow** → mode `selftest`.
+
+**This integration has not been exercised against a real Angel One
+account** — only against SmartAPI's documented request/response shape,
+validated with a mocked HTTP layer offline (23 checks: auth flow, token
+caching, 401 → re-login, malformed/empty responses, interval mapping). Step
+4 above is not optional the first time you switch to it.
+
+If prices ever look wrong after switching, the likely cause is
+`ANGELONE_SYMBOL_TOKEN` — it defaults to `99926000` (the commonly published
+NSE token for the "Nifty 50" index); `providers.py`'s `AngelOneProvider`
+docstring explains how to look up the correct one from Angel One's scrip
+master if that default is ever wrong for your account. That's a variable
+change, not a code change.
 
 Any other broker (Upstox, Fyers, Dhan, 5paisa, …) follows the same pattern:
 add a class to `providers.py` implementing `daily_bars()` and
@@ -122,9 +141,52 @@ This repo mitigates it two ways, but does not — cannot — fully solve it:
    will never tell you to buy something two hours late again.
 
 If you need the entry to actually land inside 3:21–3:28 PM every day, move the
-scheduler off GitHub Actions — a small always-on VPS with real cron, or any
-scheduler with an SLA, calling `python btst_engine.py entry`. The engine itself
-needs no changes for that.
+scheduler off GitHub Actions entirely — see the next section.
+
+## Running on your own server (Oracle Cloud, Raspberry Pi, etc.)
+
+GitHub Actions cron cannot be fixed — only worked around. `deploy/oracle_vm_setup.sh`
+sets the bot up on any Ubuntu/Debian box (Oracle Cloud's Always Free ARM VM,
+a Raspberry Pi, a spare laptop — anything left on during market hours) using
+real cron instead:
+
+```bash
+ssh your-vm
+curl -fsSL https://raw.githubusercontent.com/Harshdpsinh/nifty-btst-bot/main/deploy/oracle_vm_setup.sh | bash
+```
+
+This one-time script:
+- Sets the VM's timezone to IST, so cron entries mean what they look like —
+  no UTC conversion, unlike GitHub Actions.
+- Clones the repo, creates a venv, installs dependencies.
+- Creates `~/.btst.env` (chmod 600, **outside** the git working tree) with
+  empty placeholders for your secrets.
+- Creates `deploy/run_engine.sh`, which loads that env file and runs one
+  engine cycle.
+- Installs a crontab entry running it every 5 minutes, 9:00–15:35 IST,
+  Monday–Friday — real per-second cron, not a best-effort queue.
+
+After it finishes:
+
+```bash
+nano ~/.btst.env                              # fill in your real values
+~/nifty-btst-bot/deploy/run_engine.sh         # test it once by hand
+tail -30 ~/nifty-btst-bot/engine.log          # confirm it ran clean
+```
+
+Once a Telegram message arrives from that manual run, cron takes over
+automatically — nothing else to do. Re-running the setup script later (to
+pull code updates) is safe: it won't duplicate the crontab entry or touch
+your existing `.btst.env`.
+
+State (`~/.btst_state.json`) is kept outside the repo on purpose, so pulling
+a code update can never conflict with or clobber your current position.
+
+**Once this is confirmed working, disable the GitHub Actions schedule** so
+you don't get duplicated notifications from both places: Settings →
+Actions → the workflow → ⋯ → Disable workflow, or delete the `schedule:`
+block in `.github/workflows/btst_schedule.yml` and keep `workflow_dispatch:`
+for occasional manual runs (e.g. `selftest`).
 
 ## Cost
 
