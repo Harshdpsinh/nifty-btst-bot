@@ -186,8 +186,9 @@ _DEFAULT_STATE: dict = {
                                      #  "expiry_date","expiry_label", and (Angel One only)
                                      #  "tradingsymbol","symbol_token","entry_premium",
                                      #  "partial_booked"}
-    "last_status_candle": None,     # candle key of the last routine status sent
+    "last_status_candle": None,     # candle key of the last routine status sent (cron path)
     "last_exit_signal_candle": None,
+    "watcher_last_status_bucket": None,  # same idea, but for watcher.py's tick-level path
 }
 
 
@@ -714,12 +715,32 @@ def run_selftest(state: dict) -> None:
         data_line = f"FAILED — {type(e).__name__}: {e}"
     log.info("Daily feed: %s", data_line)
 
+    # Contract resolution + live LTP are new, Angel-One-specific, and directly
+    # affect real trades (partial-profit booking, tick-level exits) — worth
+    # proving end to end before trusting them unattended.
+    contract_line = "n/a (provider has no option-chain support)"
+    if hasattr(PROVIDER, "resolve_option_contract"):
+        try:
+            expiry_date, expiry_label = _next_option_expiry(now.date())
+            test_contract = PROVIDER.resolve_option_contract("CE", expiry_date, TARGET_PREMIUM_VALUE)
+            index_ltp = PROVIDER.get_index_ltp()
+            option_ltp = PROVIDER.get_option_ltp(test_contract["symbol_token"])
+            contract_line = (
+                f"OK — resolved {test_contract['tradingsymbol']} @ "
+                f"{test_contract['premium']:.2f} ({expiry_label}); "
+                f"live index LTP {index_ltp:.2f}, live option LTP {option_ltp:.2f}"
+            )
+        except Exception as e:
+            contract_line = f"FAILED — {type(e).__name__}: {e}"
+    log.info("Contract resolution: %s", contract_line)
+
     send_telegram(f"""✅ BTST SELFTEST
 Time: {_stamp(now)}
 
 • Data provider: {PROVIDER.name}
 • Telegram delivery: working (you are reading this)
 • Daily feed: {data_line}
+• Contract resolution (CE, next valid expiry): {contract_line}
 • Open position: {state.get('position') or 'none'}
 • Last entry scan: {state.get('entry_scan_date') or 'never'}
 

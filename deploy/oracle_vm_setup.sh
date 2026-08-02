@@ -18,14 +18,24 @@
 #      never touch it) with empty placeholders. Nothing gets sent until you
 #      fill these in.
 #   6. Creates deploy/run_engine.sh, a wrapper that loads ~/.btst.env and
-#      runs the engine once.
+#      runs the engine once (this is what cron calls — daily entry decision
+#      on every provider, plus 30m exit monitoring as a Yahoo fallback).
 #   7. Installs a crontab entry running that wrapper every 5 minutes,
 #      9:00–15:35 IST, Monday–Friday. Re-running this script is safe: it
 #      replaces its own crontab line instead of duplicating it.
+#   8. Installs and enables btst-watcher.service (systemd) — a persistent
+#      tick-level exit monitor that only does anything when DATA_PROVIDER=
+#      angelone (needs live per-tick option/index quotes Yahoo doesn't
+#      have); on any other provider it just idles. It's what actually owns
+#      exit monitoring on Angel One — the cron path steps aside for it
+#      automatically. Runs continuously, auto-restarts on crash, survives
+#      reboots.
 #
 # State (open position, last scan date, last candle reported) lives in
 # ~/.btst_state.json — outside the git working tree, so pulling a later
-# code update can never conflict with or overwrite it.
+# code update can never conflict with or overwrite it. Both cron and the
+# watcher service read/write it, coordinated by a file lock (see
+# watcher.py's _locked_state()) so the two can never corrupt each other.
 
 set -euo pipefail
 
@@ -92,6 +102,15 @@ CRON_LINE="*/5 9-15 * * 1-5 $RUN_SCRIPT"
 # echo runs, silently installing an EMPTY crontab.
 ( crontab -l 2>/dev/null | grep -vF "$RUN_SCRIPT" || true ; echo "$CRON_LINE" ) | crontab -
 
+echo "==> Installing btst-watcher.service (tick-level exit monitor, Angel One only)"
+SERVICE_NAME="btst-watcher.service"
+SERVICE_DST="/etc/systemd/system/$SERVICE_NAME"
+sed -e "s|__USER__|$(whoami)|g" -e "s|__HOME__|$HOME|g" \
+  "$APP_DIR/deploy/btst-watcher.service" | sudo tee "$SERVICE_DST" > /dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable "$SERVICE_NAME"
+sudo systemctl restart "$SERVICE_NAME"
+
 cat <<EOF
 
 Done. Next steps:
@@ -102,7 +121,15 @@ Done. Next steps:
   3. Once that Telegram message arrives, you're live — cron runs this
      automatically every 5 minutes during market hours from now on, with a
      real per-second clock instead of GitHub Actions' best-effort queue.
-  4. Go disable the GitHub Actions schedule (see the README's "Running on
+  4. If you're using DATA_PROVIDER=angelone: after filling in the
+     ANGELONE_* secrets in $ENV_FILE, restart the watcher so it picks them
+     up:
+       sudo systemctl restart btst-watcher
+     Check it's alive:
+       sudo systemctl status btst-watcher
+       tail -30 $APP_DIR/watcher.log
+     On any other provider it's safe to leave enabled -- it just idles.
+  5. Go disable the GitHub Actions schedule (see the README's "Running on
      your own server" section) so you stop getting duplicate notifications
      from both places.
 EOF

@@ -1,0 +1,22 @@
+[Unit]
+Description=NIFTY BTST tick-level exit watcher (Angel One only; idles harmlessly on other providers)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__HOME__/nifty-btst-bot
+EnvironmentFile=__HOME__/.btst.env
+ExecStart=__HOME__/nifty-btst-bot/.venv/bin/python __HOME__/nifty-btst-bot/watcher.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:__HOME__/nifty-btst-bot/watcher.log
+StandardError=append:__HOME__/nifty-btst-bot/watcher.log
+
+# EnvironmentFile is only read at service (re)start -- after editing
+# ~/.btst.env (new secrets, switching DATA_PROVIDER), run:
+#   sudo systemctl restart btst-watcher
+
+[Install]
+WantedBy=multi-user.target
