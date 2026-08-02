@@ -4,7 +4,7 @@ Scans NIFTY 50 for a Buy-Today-Sell-Tomorrow options entry at ~3:20 PM IST and
 monitors 30-minute Heikin-Ashi candles the next session for an exit. Alerts go
 to Telegram.
 
-## Strategy (unchanged)
+## Strategy
 
 **Entry** — at 3:20 PM IST, compare live spot against the forming daily
 Heikin-Ashi close:
@@ -17,13 +17,37 @@ Heikin-Ashi close:
 
 Execute between 3:21–3:28 PM IST.
 
-**Exit** — next session, on 30m Heikin-Ashi candles:
+**Which expiry to buy** — weekly NIFTY expiry is Tuesday. Never buy a
+contract inside its own expiry week's Monday or Tuesday (too close: heavy
+decay, no room for the move to play out overnight):
 
-- Holding CE: exit when the current HA low breaks below the previous **red**
-  candle's HA low.
-- Holding PE: exit when the current HA high breaks above the previous **green**
-  candle's HA high.
+| Signal fires on | Buy this expiry |
+| --- | --- |
+| Monday or Tuesday | **Next** week's Tuesday (this week's is too close) |
+| Wed / Thu / Fri | The nearest upcoming Tuesday |
+
+If that Tuesday is the last one in its calendar month, it's the monthly
+contract (NSE doesn't list a separate weekly that week) — the signal message
+labels it `MONTHLY` instead of `WEEKLY` so there's no ambiguity. Pure date
+arithmetic (`_next_option_expiry` in `btst_engine.py`), no options-chain
+lookup involved — if NSE ever moves the weekly expiry weekday again (it has
+before), `WEEKLY_EXPIRY_WEEKDAY` is the one constant to change.
+
+**Exit** — next session, on 30m Heikin-Ashi candles, compared against a
+**fixed reference: the entry day's own closing 30m candle** — not whatever
+candle happens to precede the current one. That reference never changes
+during the exit day, no matter how many candles pass:
+
+- Holding CE: exit when the current HA low breaks below the entry day's
+  closing candle's HA low (only armed if that candle was **red**).
+- Holding PE: exit when the current HA high breaks above the entry day's
+  closing candle's HA high (only armed if that candle was **green**).
 - Hard square-off at **3:13 PM IST** regardless. Never carry into a second night.
+
+(Earlier versions of this bot compared against the immediately-preceding
+candle, which drifted through the day instead of staying pinned to the
+entry day — fixed, with a regression test proving the two approaches
+produce different answers on the same data.)
 
 All strategy constants live in the `STRATEGY` block at the top of
 `btst_engine.py`.

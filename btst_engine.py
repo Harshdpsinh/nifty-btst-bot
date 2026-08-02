@@ -49,6 +49,17 @@ DIVERGENCE_THRESHOLD = 11.0          # points, applied symmetrically
 HARD_EXIT_TIME = dt.time(15, 13)     # square-off cutoff
 ENTRY_WINDOW = "3:21 PM - 3:28 PM IST"
 TARGET_PREMIUM = "~Rs.100"
+
+# NSE NIFTY weekly options expiry. Monday=0 ... Sunday=6. Currently Tuesday;
+# NSE has changed this weekday before (Thursday -> Monday -> Tuesday) — if it
+# moves again, this one constant is the only thing that needs to change.
+WEEKLY_EXPIRY_WEEKDAY = 1  # Tuesday
+
+# Never buy a contract inside its own expiry week's Monday/Tuesday (1-2
+# calendar days of runway left is too close: heavy theta decay, and a slow
+# move has no room to play out overnight). Roll to the following week's
+# expiry instead. Wed/Thu/Fri entries are far enough out (4-6 days) and use
+# the nearest upcoming Tuesday as normal.
 # ------------------------------------------------------------------------
 
 # --- scheduling gates (operational, not strategy) ---
@@ -94,6 +105,23 @@ def _now() -> dt.datetime:
 
 def _stamp(now: dt.datetime | None = None) -> str:
     return (now or _now()).strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def _next_option_expiry(today: dt.date) -> tuple[dt.date, str]:
+    """Pick which expiry to buy today, per the risk rule above: skip the
+    current week's expiry entirely if today is its Monday or Tuesday (too
+    close), rolling to the following week instead. Returns (date, label)
+    where label is "MONTHLY" if that date happens to be the last Tuesday of
+    its calendar month (NSE doesn't list a separate weekly contract that
+    week — the weekly and monthly contract are the same instrument), else
+    "WEEKLY".
+    """
+    days_ahead = (WEEKLY_EXPIRY_WEEKDAY - today.weekday()) % 7
+    candidate = today + dt.timedelta(days=days_ahead)  # this week's expiry weekday
+    if today.weekday() in (0, 1):  # Monday or Tuesday: this week's expiry is too close
+        candidate += dt.timedelta(days=7)
+    is_monthly = (candidate + dt.timedelta(days=7)).month != candidate.month
+    return candidate, ("MONTHLY" if is_monthly else "WEEKLY")
 
 
 # --------------------------- notifications ---------------------------
@@ -146,7 +174,8 @@ def send_telegram(message: str) -> bool:
 
 _DEFAULT_STATE: dict = {
     "entry_scan_date": None,        # ISO date the entry scan completed
-    "position": None,               # {"side","entry_spot","opened_at","opened_date"}
+    "position": None,               # {"side","entry_spot","opened_at","opened_date",
+                                     #  "expiry_date","expiry_label"}
     "last_status_candle": None,     # candle key of the last routine status sent
     "last_exit_signal_candle": None,
 }
@@ -186,6 +215,14 @@ def save_state(state: dict) -> None:
 def _last_timestamp_ist(df: pd.DataFrame) -> pd.Timestamp:
     ts = pd.Timestamp(df.index[-1])
     return ts.tz_convert(IST) if ts.tzinfo is not None else ts.tz_localize(IST)
+
+
+def _last_candle_of(ha_df: pd.DataFrame, day: dt.date) -> pd.Series | None:
+    """The last 30m HA candle belonging to calendar date `day`, or None if
+    that date isn't in the fetched window.
+    """
+    day_rows = ha_df[ha_df.index.date == day]
+    return day_rows.iloc[-1] if not day_rows.empty else None
 
 
 def get_live_daily_data() -> tuple[float, float]:
@@ -237,8 +274,14 @@ def calculate_30m_heikin_ashi() -> pd.DataFrame:
 # ---------------------------- messages ----------------------------
 
 
-def _signal_message(side: str, now_ist: str, spot: float, ha: float, div: float) -> str:
+def _signal_message(side: str, now_ist: str, spot: float, ha: float, div: float,
+                     expiry_date: dt.date, expiry_label: str, expiry_rolled: bool) -> str:
     is_call = side == "CE"
+    expiry_note = (
+        "\n  (this week's expiry was too close to buy today — rolled forward\n"
+        "  per the no-buying-inside-expiry-week-Mon/Tue rule)"
+        if expiry_rolled else ""
+    )
     return f"""🚨 BTST SIGNAL DETECTED 🚨
 Asset: NIFTY 50 (Spot)
 Time: {now_ist}
@@ -254,6 +297,7 @@ Timeframe: Daily (1D) Live
 
 ⚡ ACTIONABLE STEPS
 Contract: Nifty {'Call' if is_call else 'Put'} Option ({side})
+Expiry: {expiry_date.strftime('%d %b %Y (%A)')} — {expiry_label}{expiry_note}
 Target Premium: {TARGET_PREMIUM}
 Order Type: NRML / CNC (Do not use MIS)
 Window: Execute between {ENTRY_WINDOW}
@@ -361,15 +405,21 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
         side = None
 
     if side:
-        send_telegram(_signal_message(side, now_ist, live_spot, ha_close, divergence))
+        expiry_date, expiry_label = _next_option_expiry(now.date())
+        expiry_rolled = now.weekday() in (0, 1)
+        send_telegram(_signal_message(side, now_ist, live_spot, ha_close, divergence,
+                                       expiry_date, expiry_label, expiry_rolled))
         state["position"] = {
             "side": side,
             "entry_spot": round(live_spot, 2),
             "opened_at": now_ist,
             "opened_date": today,
+            "expiry_date": expiry_date.isoformat(),
+            "expiry_label": expiry_label,
         }
         state["last_exit_signal_candle"] = None
-        log.info("Position recorded: %s @ %.2f", side, live_spot)
+        log.info("Position recorded: %s @ %.2f, expiry %s (%s)",
+                  side, live_spot, expiry_date.isoformat(), expiry_label)
     else:
         send_telegram(_no_trade_message(now_ist, live_spot, ha_close, divergence))
         state["position"] = None
@@ -406,6 +456,28 @@ Do not carry this position into a second night.""")
 
     try:
         ha_df = calculate_30m_heikin_ashi()
+        latest = ha_df.iloc[-1]
+        candle_key = str(ha_df.index[-1])
+
+        # The reference level is FIXED to the entry day's closing 30m candle —
+        # not a rolling "whatever candle came before this one," which would
+        # drift through the exit day and compare against the wrong level as
+        # new candles form. When flat (no position), fall back to the most
+        # recent prior session's close purely for the informational status
+        # update below.
+        if position:
+            reference_day = dt.date.fromisoformat(position["opened_date"])
+        else:
+            prior_days = sorted(d for d in set(ha_df.index.date) if d < latest.name.date())
+            reference_day = prior_days[-1] if prior_days else None
+
+        reference = _last_candle_of(ha_df, reference_day) if reference_day else None
+        if reference is None:
+            raise StaleDataError(
+                f"No 30m candle data found for {reference_day} (the entry day's "
+                f"closing candle) within the last {INTRADAY_LOOKBACK_DAYS} days — "
+                f"can't evaluate the exit level."
+            )
     except StaleDataError as e:
         # Holiday or a lagging feed: log it, don't page the user every 15 min.
         log.warning("Exit scan skipped: %s", e)
@@ -418,10 +490,6 @@ Do not carry this position into a second night.""")
         )
         return
 
-    latest = ha_df.iloc[-1]
-    prev = ha_df.iloc[-2]
-    candle_key = str(ha_df.index[-1])
-
     if latest["Is_Red"]:
         candle_color = "🔴 RED"
     elif latest["Is_Green"]:
@@ -430,17 +498,18 @@ Do not carry this position into a second night.""")
         candle_color = "⚪ FLAT"
 
     # 2. Heikin-Ashi breakout exit signals — only for the side actually held,
-    #    and only once per candle.
+    #    and only once per candle. Always against the entry day's fixed
+    #    closing candle, never against an intermediate candle from today.
     already_signalled = state.get("last_exit_signal_candle") == candle_key
     if position and not already_signalled:
         side = position["side"]
-        if side == "CE" and prev["Is_Red"] and latest["HA_Low"] < prev["HA_Low"]:
+        if side == "CE" and reference["Is_Red"] and latest["HA_Low"] < reference["HA_Low"]:
             send_telegram(f"""🛑 CALL (CE) EXIT SIGNAL TRIGGERED
 Time: {now_time}
-Reason: 30m HA Candle Low broken by Current HA Low
+Reason: Entry-day closing 30m HA Low broken by current HA Low
 
 📊 HEIKIN-ASHI DATA
-• Reference 30m Red HA Low: {prev['HA_Low']:.2f}
+• Entry-day ({reference_day}) closing 30m Red HA Low: {reference['HA_Low']:.2f}
 • Current 30m HA Low: {latest['HA_Low']:.2f} (Broken 👇)
 • Spot Close: {latest['Close']:.2f}
 
@@ -449,13 +518,13 @@ Reason: 30m HA Candle Low broken by Current HA Low
             state["position"] = None
             position = None
 
-        elif side == "PE" and prev["Is_Green"] and latest["HA_High"] > prev["HA_High"]:
+        elif side == "PE" and reference["Is_Green"] and latest["HA_High"] > reference["HA_High"]:
             send_telegram(f"""🛑 PUT (PE) EXIT SIGNAL TRIGGERED
 Time: {now_time}
-Reason: 30m HA Candle High broken by Current HA High
+Reason: Entry-day closing 30m HA High broken by current HA High
 
 📊 HEIKIN-ASHI DATA
-• Reference 30m Green HA High: {prev['HA_High']:.2f}
+• Entry-day ({reference_day}) closing 30m Green HA High: {reference['HA_High']:.2f}
 • Current 30m HA High: {latest['HA_High']:.2f} (Broken 👆)
 • Spot Close: {latest['Close']:.2f}
 
@@ -474,20 +543,24 @@ Reason: 30m HA Candle High broken by Current HA High
         state["last_status_candle"] = candle_key
         return
 
-    # Only one exit level is ever armed: the one matching the previous candle's
-    # colour. Printing both made a green candle's low look like a red reference.
-    if prev["Is_Red"]:
+    # Only one exit level is ever armed: the one matching the entry day's
+    # closing candle's colour. Printing both made a green candle's low look
+    # like a red reference.
+    ref_when = "entry-day" if position else "previous session's"
+    if reference["Is_Red"]:
         ref_block = (
-            f"• ARMED (CE exit): prev 🔴 RED HA Low {prev['HA_Low']:.2f}\n"
+            f"• ARMED (CE exit): {ref_when} closing 🔴 RED HA Low ({reference_day}) "
+            f"{reference['HA_Low']:.2f}\n"
             f"  → exit Calls if current HA Low breaks below it"
         )
-    elif prev["Is_Green"]:
+    elif reference["Is_Green"]:
         ref_block = (
-            f"• ARMED (PE exit): prev 🟢 GREEN HA High {prev['HA_High']:.2f}\n"
+            f"• ARMED (PE exit): {ref_when} closing 🟢 GREEN HA High ({reference_day}) "
+            f"{reference['HA_High']:.2f}\n"
             f"  → exit Puts if current HA High breaks above it"
         )
     else:
-        ref_block = "• No exit level armed (previous HA candle is flat)"
+        ref_block = f"• No exit level armed ({ref_when} closing HA candle is flat)"
 
     if position:
         pos_line = (
