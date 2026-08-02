@@ -103,8 +103,11 @@ class YahooProvider(MarketDataProvider):
 
 class AngelOneProvider(MarketDataProvider):
     """Free with an Angel One demat account. Official real-time NSE data via
-    SmartAPI (https://smartapi.angelbroking.com), using the getCandleData
-    historical endpoint for both the daily and 30m candles.
+    SmartAPI (https://smartapi.angelbroking.com): getCandleData for daily/30m
+    index candles, plus searchScrip + batch quote for resolving and pricing
+    the actual option contract bought (used by watcher.py for partial-profit
+    and tick-level exit tracking — see resolve_option_contract/get_quotes/
+    get_index_ltp/get_option_ltp below).
 
     Required env vars / repository secrets:
       ANGELONE_API_KEY       — generated on the SmartAPI portal after
@@ -129,16 +132,21 @@ class AngelOneProvider(MarketDataProvider):
                                 and set this instead of touching code.
       ANGELONE_BASE_URL      — defaults to https://apiconnect.angelone.in
 
-    Important caveat: unlike YahooProvider, this has not been exercised
+    Important caveat: unlike YahooProvider, none of this has been exercised
     against a real Angel One account (no test credentials were available
     when this was written) — only against the documented SmartAPI request/
     response shape and a mocked HTTP layer (see the offline test suite).
-    Run `python btst_engine.py selftest` with DATA_PROVIDER=angelone before
-    trusting it for a live trade. If SmartAPI's historical endpoint doesn't
-    include the still-forming candle for your account/plan, the engine's
-    existing staleness checks will raise StaleDataError and notify you
-    rather than silently trading on stale data — they don't require any
-    Angel-One-specific handling.
+    Field-name casing in particular ("symboltoken" vs "symbolToken") is
+    inconsistent across SmartAPI's own docs, so get_quotes()/
+    search_option_chain() check both defensively, but a real account is the
+    only real test. Run `python btst_engine.py selftest` with
+    DATA_PROVIDER=angelone before trusting it for a live trade, and watch
+    the first live entry's contract-resolution step closely before trusting
+    watcher.py unattended. If SmartAPI's historical endpoint doesn't include
+    the still-forming candle for your account/plan, the engine's existing
+    staleness checks will raise StaleDataError and notify you rather than
+    silently trading on stale data — they don't require any Angel-One-
+    specific handling.
     """
 
     name = "angelone"
@@ -208,17 +216,11 @@ class AngelOneProvider(MarketDataProvider):
         self._jwt_token = body["data"]["jwtToken"]
         log.info("Angel One SmartAPI login OK.")
 
-    def _get_candles(self, interval_code: str, from_date: dt.datetime,
-                      to_date: dt.datetime) -> pd.DataFrame:
-        payload = {
-            "exchange": self.EXCHANGE,
-            "symboltoken": self.symbol_token,
-            "interval": interval_code,
-            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
-            "todate": to_date.strftime("%Y-%m-%d %H:%M"),
-        }
-        url = f"{self.base_url}/rest/secure/angelbroking/historical/v1/getCandleData"
-
+    def _post(self, path: str, payload: dict) -> dict:
+        """POST with retry, lazy login, and a forced re-login on 401. Returns
+        the parsed JSON body. Shared by every SmartAPI call this class makes.
+        """
+        url = f"{self.base_url}{path}"
         last_err: Exception | None = None
         for attempt in range(1, self.RETRIES + 1):
             try:
@@ -235,21 +237,33 @@ class AngelOneProvider(MarketDataProvider):
                 resp.raise_for_status()
                 body = resp.json()
                 if not body.get("status"):
-                    raise ProviderError(f"Angel One getCandleData failed: {body.get('message', body)}")
-                rows = body.get("data") or []
-                if not rows:
-                    raise ProviderError("Angel One returned no candles for the requested range")
-                df = pd.DataFrame(rows, columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
-                df["Datetime"] = pd.to_datetime(df["Datetime"])
-                df = df.set_index("Datetime")[["Open", "High", "Low", "Close"]].astype(float)
-                return _localize(df)
+                    raise ProviderError(f"Angel One request to {path} failed: {body.get('message', body)}")
+                return body
             except Exception as e:
                 last_err = e
-            log.warning("Angel One candle fetch attempt %d/%d failed: %s",
-                        attempt, self.RETRIES, last_err)
+            log.warning("Angel One request attempt %d/%d failed (%s): %s",
+                        attempt, self.RETRIES, path, last_err)
             if attempt < self.RETRIES:
                 time.sleep(self.BACKOFF_SEC * attempt)
-        raise ProviderError(f"Failed to fetch Angel One candles ({interval_code}): {last_err}")
+        raise ProviderError(f"Angel One request to {path} failed: {last_err}")
+
+    def _get_candles(self, interval_code: str, from_date: dt.datetime,
+                      to_date: dt.datetime) -> pd.DataFrame:
+        payload = {
+            "exchange": self.EXCHANGE,
+            "symboltoken": self.symbol_token,
+            "interval": interval_code,
+            "fromdate": from_date.strftime("%Y-%m-%d %H:%M"),
+            "todate": to_date.strftime("%Y-%m-%d %H:%M"),
+        }
+        body = self._post("/rest/secure/angelbroking/historical/v1/getCandleData", payload)
+        rows = body.get("data") or []
+        if not rows:
+            raise ProviderError("Angel One returned no candles for the requested range")
+        df = pd.DataFrame(rows, columns=["Datetime", "Open", "High", "Low", "Close", "Volume"])
+        df["Datetime"] = pd.to_datetime(df["Datetime"])
+        df = df.set_index("Datetime")[["Open", "High", "Low", "Close"]].astype(float)
+        return _localize(df)
 
     def daily_bars(self, symbol: str, lookback_days: int) -> pd.DataFrame:
         now = dt.datetime.now(IST)
@@ -266,6 +280,107 @@ class AngelOneProvider(MarketDataProvider):
         now = dt.datetime.now(IST)
         from_date = now - dt.timedelta(days=lookback_days)
         return self._get_candles(interval_code, from_date, now)
+
+    # ------------------- option-contract resolution & live LTP -------------------
+    # Angel-One-specific: not part of the MarketDataProvider interface, since
+    # Yahoo has no options-chain or per-strike live-quote data at all. Callers
+    # must check hasattr(provider, "resolve_option_contract") before using
+    # these — see btst_engine.run_entry_scan and watcher.py.
+
+    OPTIONS_EXCHANGE = "NFO"
+    UNDERLYING = "NIFTY"
+
+    def search_option_chain(self, expiry: dt.date) -> list[dict]:
+        """Every NFO option contract (both CE and PE, all strikes) for
+        UNDERLYING's `expiry`. Angel One's NFO tradingsymbol format is
+        <UNDERLYING><DDMMMYY><STRIKE><CE|PE>, e.g. "NIFTY04AUG2624300CE".
+        """
+        expiry_tag = expiry.strftime("%d%b%y").upper()  # e.g. "04AUG26"
+        body = self._post(
+            "/rest/secure/angelbroking/order/v1/searchScrip",
+            {"exchange": self.OPTIONS_EXCHANGE, "searchscrip": f"{self.UNDERLYING}{expiry_tag}"},
+        )
+        matches = body.get("data") or []
+        contracts = []
+        for m in matches:
+            ts = m.get("tradingsymbol") or m.get("tradingSymbol") or ""
+            token = m.get("symboltoken") or m.get("symbolToken")
+            if not ts or token is None:
+                continue
+            # Defense: keep only exact expiry-tag matches ending in CE/PE —
+            # a substring search can surface near-miss expiries/instruments.
+            if expiry_tag not in ts or not (ts.endswith("CE") or ts.endswith("PE")):
+                continue
+            contracts.append({"tradingsymbol": ts, "symbol_token": str(token)})
+        if not contracts:
+            raise ProviderError(
+                f"No {self.UNDERLYING} option contracts found for expiry {expiry} "
+                f"(searched for '{self.UNDERLYING}{expiry_tag}')"
+            )
+        return contracts
+
+    def get_quotes(self, tokens: list[str], exchange: str | None = None) -> dict[str, float]:
+        """Batch LTP lookup -> {symbol_token: ltp}. One call for many tokens
+        (used to price an entire option chain side in a single request).
+        """
+        exchange = exchange or self.OPTIONS_EXCHANGE
+        body = self._post(
+            "/rest/secure/angelbroking/market/v1/quote/",
+            {"mode": "LTP", "exchangeTokens": {exchange: list(tokens)}},
+        )
+        fetched = (body.get("data") or {}).get("fetched") or []
+        out: dict[str, float] = {}
+        for row in fetched:
+            token = row.get("symbolToken") or row.get("symboltoken")
+            ltp = row.get("ltp")
+            if token is not None and ltp is not None:
+                out[str(token)] = float(ltp)
+        return out
+
+    def resolve_option_contract(self, side: str, expiry: dt.date, target_premium: float) -> dict:
+        """Find the strike whose live premium is closest to `target_premium`
+        for `side` ("CE"/"PE") at `expiry`. Two API calls total: one search
+        across every strike, one batch quote to price all of them at once.
+        Returns {"tradingsymbol", "symbol_token", "premium"}.
+        """
+        side = side.upper()
+        if side not in ("CE", "PE"):
+            raise ProviderError(f"resolve_option_contract: side must be CE or PE, got {side!r}")
+
+        contracts = [c for c in self.search_option_chain(expiry) if c["tradingsymbol"].endswith(side)]
+        if not contracts:
+            raise ProviderError(f"No {self.UNDERLYING} {side} contracts found for expiry {expiry}")
+
+        quotes = self.get_quotes([c["symbol_token"] for c in contracts])
+        priced = [(c, quotes[c["symbol_token"]]) for c in contracts if c["symbol_token"] in quotes]
+        if not priced:
+            raise ProviderError(
+                f"Angel One returned no live quotes for any {self.UNDERLYING} {side} "
+                f"contract at expiry {expiry}"
+            )
+
+        best_contract, best_ltp = min(priced, key=lambda cp: abs(cp[1] - target_premium))
+        return {
+            "tradingsymbol": best_contract["tradingsymbol"],
+            "symbol_token": best_contract["symbol_token"],
+            "premium": best_ltp,
+        }
+
+    def get_index_ltp(self) -> float:
+        """Live NIFTY 50 index LTP — for reconstructing the still-forming
+        30m candle tick by tick, without repeatedly hitting getCandleData.
+        """
+        quotes = self.get_quotes([self.symbol_token], exchange=self.EXCHANGE)
+        if self.symbol_token not in quotes:
+            raise ProviderError("Angel One quote response did not include the NIFTY index LTP")
+        return quotes[self.symbol_token]
+
+    def get_option_ltp(self, symbol_token: str) -> float:
+        """Live LTP for a specific held option contract, by its token."""
+        quotes = self.get_quotes([symbol_token])
+        if symbol_token not in quotes:
+            raise ProviderError(f"Angel One quote response did not include LTP for token {symbol_token}")
+        return quotes[symbol_token]
 
 
 _PROVIDERS: dict[str, type[MarketDataProvider]] = {

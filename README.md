@@ -33,21 +33,28 @@ arithmetic (`_next_option_expiry` in `btst_engine.py`), no options-chain
 lookup involved — if NSE ever moves the weekly expiry weekday again (it has
 before), `WEEKLY_EXPIRY_WEEKDAY` is the one constant to change.
 
-**Exit** — next session, on 30m Heikin-Ashi candles, compared against a
-**fixed reference: the entry day's own closing 30m candle** — not whatever
-candle happens to precede the current one. That reference never changes
-during the exit day, no matter how many candles pass:
+**Exit** — next session, on 30m Heikin-Ashi candles built fresh for that
+day only (never a continuation from the entry day or any earlier session).
+The reference level is **sticky**: the most recently *closed* red (CE) /
+green (PE) candle seen so far that day, updating forward each time a newer
+one of that colour closes. A candle of the other colour closing in between
+does **not** erase it — and it's always the *latest* one, never "first
+seen" or "lowest/highest so far":
 
-- Holding CE: exit when the current HA low breaks below the entry day's
-  closing candle's HA low (only armed if that candle was **red**).
-- Holding PE: exit when the current HA high breaks above the entry day's
-  closing candle's HA high (only armed if that candle was **green**).
+- Holding CE: exit when price breaks below the latest closed red candle's HA low.
+- Holding PE: exit when price breaks above the latest closed green candle's HA high.
+- Checked **tick-level, live** (Angel One only — see below) — fires the
+  moment the still-forming candle's running low/high crosses the reference,
+  without waiting for that candle to close. On other providers it's checked
+  once per cron invocation (every 5-15 min) instead.
 - Hard square-off at **3:13 PM IST** regardless. Never carry into a second night.
 
-(Earlier versions of this bot compared against the immediately-preceding
-candle, which drifted through the day instead of staying pinned to the
-entry day — fixed, with a regression test proving the two approaches
-produce different answers on the same data.)
+**Partial profit booking** (Angel One only, needs a live per-strike premium
+Yahoo doesn't have): once the resolved contract's live premium reaches **2×
+its actual entry premium**, the bot immediately books 50% of the position.
+The remaining 50% keeps being watched by the exact same full-exit rule above,
+unchanged. Both the multiplier (`PARTIAL_PROFIT_MULTIPLIER`) and the fraction
+booked (`PARTIAL_PROFIT_FRACTION`) are constants in `btst_engine.py`.
 
 All strategy constants live in the `STRATEGY` block at the top of
 `btst_engine.py`.
@@ -92,9 +99,10 @@ needs a code change or a push.
 
 **This integration has not been exercised against a real Angel One
 account** — only against SmartAPI's documented request/response shape,
-validated with a mocked HTTP layer offline (23 checks: auth flow, token
-caching, 401 → re-login, malformed/empty responses, interval mapping). Step
-4 above is not optional the first time you switch to it.
+validated with a mocked HTTP layer offline (34 checks across auth flow,
+token caching, 401 → re-login, malformed/empty responses, interval mapping,
+option-chain search, and batch quote parsing). Step 4 above is not optional
+the first time you switch to it.
 
 If prices ever look wrong after switching, the likely cause is
 `ANGELONE_SYMBOL_TOKEN` — it defaults to `99926000` (the commonly published
@@ -106,7 +114,44 @@ change, not a code change.
 Any other broker (Upstox, Fyers, Dhan, 5paisa, …) follows the same pattern:
 add a class to `providers.py` implementing `daily_bars()` and
 `intraday_bars()`, register it in `_PROVIDERS`, done. Nothing in
-`btst_engine.py` needs to change.
+`btst_engine.py` needs to change. Partial-profit tracking and the tick-level
+watcher additionally need `resolve_option_contract()`, `get_index_ltp()`,
+and `get_option_ltp()` (see `providers.py`'s `AngelOneProvider` for the
+reference implementation) — a broker without those just gets the full-exit
+rule via cron, same as Yahoo.
+
+## Tick-level exit monitoring (`watcher.py`)
+
+On `DATA_PROVIDER=angelone`, exit monitoring is NOT handled by cron —
+`btst_engine.py`'s `run_auto()` automatically steps aside (it detects
+`PROVIDER.get_index_ltp`) so the two never race on the same position.
+Instead, `watcher.py` is a **separate, persistent process** that:
+
+- Loops every `BTST_WATCHER_POLL_SECONDS` (default 10s) during market hours,
+  polling live LTP for the NIFTY index and (if applicable) the held option
+  contract — far faster than cron's 5-15 min cadence.
+- Reconstructs the still-forming 30m candle's Heikin-Ashi values in memory
+  from those ticks, re-syncing against the authoritative `getCandleData`
+  result at every real candle boundary (so tick-by-tick drift can never
+  compound — the source of truth is always refreshed every 30 minutes).
+- Fires the full-exit and partial-profit alerts the instant a break happens,
+  not on the next cron wake-up.
+- Persists all state through the same `state.json` as cron, coordinated by a
+  file lock (`_locked_state()`) so a cron invocation and the watcher can
+  never corrupt each other's writes even if they land in the same instant.
+- On any provider other than Angel One, it just idles (logging why every so
+  often) — safe to leave the systemd service enabled regardless.
+
+Not meant to be run ad hoc — see "Running on your own server" below for the
+systemd service that keeps it alive continuously. Verified with 33 offline
+checks against a mocked provider: bucket-boundary math (NSE candles align to
+`:15`/`:45`, not `:00`/`:30` — the session opens at 9:15), the live
+accumulator's HA math cross-checked against the same tested batch formula
+`btst_engine.py` itself uses, a full tick-by-tick sequence proving partial-
+then-full-exit fires exactly once each with no duplicates, hard-cutoff
+force-exit, and that a simulated process restart mid-day recovers cleanly
+from state alone. Like the rest of the Angel One integration, it has not
+been run against a real account — the same caution above applies.
 
 ## Running it manually
 
@@ -186,25 +231,42 @@ This one-time script:
 - Creates `~/.btst.env` (chmod 600, **outside** the git working tree) with
   empty placeholders for your secrets.
 - Creates `deploy/run_engine.sh`, which loads that env file and runs one
-  engine cycle.
+  engine cycle (the daily entry decision on every provider, plus the 30m
+  exit rule as a Yahoo fallback).
 - Installs a crontab entry running it every 5 minutes, 9:00–15:35 IST,
   Monday–Friday — real per-second cron, not a best-effort queue.
+- Installs and enables `btst-watcher.service` (systemd) — the persistent
+  tick-level exit monitor from the section above. Auto-restarts on crash,
+  survives reboots, and is safe to leave enabled even if you're on
+  `DATA_PROVIDER=yahoo` (it just idles).
 
 After it finishes:
 
 ```bash
 nano ~/.btst.env                              # fill in your real values
-~/nifty-btst-bot/deploy/run_engine.sh         # test it once by hand
+~/nifty-btst-bot/deploy/run_engine.sh         # test the entry/exit cron path once by hand
 tail -30 ~/nifty-btst-bot/engine.log          # confirm it ran clean
 ```
 
 Once a Telegram message arrives from that manual run, cron takes over
 automatically — nothing else to do. Re-running the setup script later (to
-pull code updates) is safe: it won't duplicate the crontab entry or touch
-your existing `.btst.env`.
+pull code updates) is safe: it won't duplicate the crontab entry, restart
+the watcher unnecessarily, or touch your existing `.btst.env`.
+
+If you're on `DATA_PROVIDER=angelone`, after filling in the `ANGELONE_*`
+secrets, restart the watcher so it picks them up (`EnvironmentFile` is only
+read at service start, not live):
+
+```bash
+sudo systemctl restart btst-watcher
+sudo systemctl status btst-watcher     # confirm it's active
+tail -30 ~/nifty-btst-bot/watcher.log  # watch it tick
+```
 
 State (`~/.btst_state.json`) is kept outside the repo on purpose, so pulling
-a code update can never conflict with or clobber your current position.
+a code update can never conflict with or clobber your current position. Both
+cron and the watcher read/write it, coordinated by a file lock so the two
+processes can never corrupt each other's writes.
 
 **Once this is confirmed working, disable the GitHub Actions schedule** so
 you don't get duplicated notifications from both places: Settings →
@@ -226,4 +288,13 @@ per-candle redundancy but halve the cost.
   and occasionally wrong. Do not treat it as a broker feed.
 - NSE holidays are detected from the data (the daily candle's date), not a
   calendar, so a badly lagging feed looks the same as a holiday.
-- The engine notifies; it does not place orders.
+- The engine notifies; it does not place orders — including partial-profit
+  and full-exit alerts. You still execute every trade by hand.
+- Partial-profit booking and tick-level exits only exist on
+  `DATA_PROVIDER=angelone` and require `watcher.py` running continuously
+  (the systemd service). On Yahoo, or if the watcher isn't running, you get
+  the full-exit rule only, checked at cron's cadence — no partial booking.
+- None of the Angel One integration (candles, option-chain resolution, live
+  quotes, the watcher) has been run against a real account. Treat every
+  first switch-over as something to watch closely, not something to trust
+  unattended on day one.
