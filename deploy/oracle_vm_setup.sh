@@ -55,15 +55,24 @@ sudo timedatectl set-timezone Asia/Kolkata
 
 echo "==> Installing system packages"
 sudo apt-get update -y
-sudo apt-get install -y software-properties-common git cron
+sudo apt-get install -y software-properties-common python3 python3-venv python3-pip git cron
 
+# Try for Python 3.11 via deadsnakes, but this is best-effort: deadsnakes
+# stops building for an Ubuntu release once it goes end-of-life, so on an
+# older/EOL box (e.g. 20.04 "focal", EOL May 2025) this can legitimately
+# have nothing to install. Never let that abort the whole setup -- fall
+# back to whatever "python3" already is on the system instead.
+PYTHON="python3"
 if ! command -v python3.11 >/dev/null 2>&1; then
-  echo "==> Python 3.11 not found — adding the deadsnakes PPA"
-  sudo add-apt-repository -y ppa:deadsnakes/ppa
-  sudo apt-get update -y
+  echo "==> Python 3.11 not found — trying the deadsnakes PPA (best-effort)"
+  sudo add-apt-repository -y ppa:deadsnakes/ppa || true
+  sudo apt-get update -y || true
 fi
-sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
-PYTHON=python3.11
+if sudo apt-get install -y python3.11 python3.11-venv python3.11-dev 2>/dev/null; then
+  PYTHON="python3.11"
+else
+  echo "==> python3.11 unavailable for this OS release — falling back to $($PYTHON --version)"
+fi
 
 echo "==> Fetching the bot into $APP_DIR"
 if [ -d "$APP_DIR/.git" ]; then
@@ -72,14 +81,25 @@ else
   git clone "$REPO_URL" "$APP_DIR"
 fi
 
-echo "==> Creating virtualenv (Python 3.11) and installing dependencies"
+echo "==> Creating virtualenv ($PYTHON) and installing dependencies"
 cd "$APP_DIR"
 # --clear: if a venv already exists from an older run of this script (e.g.
-# one made with the system's Python 3.8 before this fix), wipe and recreate
-# it cleanly rather than leaving a stale/mismatched environment behind.
+# one made with a different Python before this fix), wipe and recreate it
+# cleanly rather than leaving a stale/mismatched environment behind.
 "$PYTHON" -m venv --clear .venv
 .venv/bin/pip install --upgrade pip --quiet
-.venv/bin/pip install -r requirements.txt --quiet
+
+# requirements.txt pins exact versions (deliberately, so a scheduled job
+# never silently picks up a breaking release) that need a fairly modern
+# Python. If that Python wasn't available above and we fell back to an
+# older system "python3", those exact pins can be impossible to satisfy --
+# fall back to installing the same packages unpinned so pip resolves
+# whatever versions actually work on this interpreter, rather than leaving
+# the whole setup dead in the water.
+if ! .venv/bin/pip install -r requirements.txt --quiet; then
+  echo "==> Exact-pinned versions don't support this Python — retrying unpinned"
+  grep -v '^#' requirements.txt | sed 's/==.*//' | xargs .venv/bin/pip install --quiet
+fi
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "==> Creating $ENV_FILE — fill this in before the bot can send anything"
