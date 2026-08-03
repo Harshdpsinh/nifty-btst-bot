@@ -10,7 +10,12 @@
 # What it does:
 #   1. Sets the VM's timezone to IST, so a plain "9-15 * * 1-5" cron entry
 #      means what it looks like — no UTC math, unlike GitHub Actions cron.
-#   2. Installs Python3 + git + cron if missing.
+#   2. Installs git + cron, and Python 3.11 specifically (via the deadsnakes
+#      PPA if not already present) rather than trusting whatever "python3"
+#      resolves to. requirements.txt pins pandas/numpy versions that dropped
+#      Python 3.8 support, and Ubuntu 20.04 -- a common, still-offered Oracle
+#      image -- ships 3.8 by default, which fails pip install with no
+#      matching distribution found.
 #   3. Clones (or updates) this repo into ~/nifty-btst-bot.
 #   4. Creates a Python venv and installs requirements.txt into it.
 #   5. Creates ~/.btst.env the first time only — a secrets file (chmod 600,
@@ -50,7 +55,15 @@ sudo timedatectl set-timezone Asia/Kolkata
 
 echo "==> Installing system packages"
 sudo apt-get update -y
-sudo apt-get install -y python3 python3-venv python3-pip git cron
+sudo apt-get install -y software-properties-common git cron
+
+if ! command -v python3.11 >/dev/null 2>&1; then
+  echo "==> Python 3.11 not found — adding the deadsnakes PPA"
+  sudo add-apt-repository -y ppa:deadsnakes/ppa
+  sudo apt-get update -y
+fi
+sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
+PYTHON=python3.11
 
 echo "==> Fetching the bot into $APP_DIR"
 if [ -d "$APP_DIR/.git" ]; then
@@ -59,9 +72,12 @@ else
   git clone "$REPO_URL" "$APP_DIR"
 fi
 
-echo "==> Creating virtualenv and installing dependencies"
+echo "==> Creating virtualenv (Python 3.11) and installing dependencies"
 cd "$APP_DIR"
-python3 -m venv .venv
+# --clear: if a venv already exists from an older run of this script (e.g.
+# one made with the system's Python 3.8 before this fix), wipe and recreate
+# it cleanly rather than leaving a stale/mismatched environment behind.
+"$PYTHON" -m venv --clear .venv
 .venv/bin/pip install --upgrade pip --quiet
 .venv/bin/pip install -r requirements.txt --quiet
 
