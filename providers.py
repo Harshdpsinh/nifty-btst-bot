@@ -319,22 +319,35 @@ class AngelOneProvider(MarketDataProvider):
             )
         return contracts
 
+    # SmartAPI's quote/LTP endpoint rejects a request with too many symbols
+    # at once ("Tokens max limit exceeded") -- confirmed against a real
+    # account. NIFTY alone has 100+ strikes per expiry, easily over
+    # whatever that cap is, so this is not a hypothetical. The exact limit
+    # isn't documented anywhere we could find; 50 is a conservative chunk
+    # size. If this error resurfaces, lower MAX_QUOTE_TOKENS_PER_REQUEST.
+    MAX_QUOTE_TOKENS_PER_REQUEST = 50
+
     def get_quotes(self, tokens: list[str], exchange: str | None = None) -> dict[str, float]:
-        """Batch LTP lookup -> {symbol_token: ltp}. One call for many tokens
-        (used to price an entire option chain side in a single request).
+        """Batch LTP lookup -> {symbol_token: ltp}. Transparently chunks
+        large token lists across multiple requests (see
+        MAX_QUOTE_TOKENS_PER_REQUEST) so callers never need to worry about
+        SmartAPI's per-request symbol cap.
         """
         exchange = exchange or self.OPTIONS_EXCHANGE
-        body = self._post(
-            "/rest/secure/angelbroking/market/v1/quote/",
-            {"mode": "LTP", "exchangeTokens": {exchange: list(tokens)}},
-        )
-        fetched = (body.get("data") or {}).get("fetched") or []
+        tokens = list(tokens)
         out: dict[str, float] = {}
-        for row in fetched:
-            token = row.get("symbolToken") or row.get("symboltoken")
-            ltp = row.get("ltp")
-            if token is not None and ltp is not None:
-                out[str(token)] = float(ltp)
+        for i in range(0, len(tokens), self.MAX_QUOTE_TOKENS_PER_REQUEST):
+            chunk = tokens[i:i + self.MAX_QUOTE_TOKENS_PER_REQUEST]
+            body = self._post(
+                "/rest/secure/angelbroking/market/v1/quote/",
+                {"mode": "LTP", "exchangeTokens": {exchange: chunk}},
+            )
+            fetched = (body.get("data") or {}).get("fetched") or []
+            for row in fetched:
+                token = row.get("symbolToken") or row.get("symboltoken")
+                ltp = row.get("ltp")
+                if token is not None and ltp is not None:
+                    out[str(token)] = float(ltp)
         return out
 
     def resolve_option_contract(self, side: str, expiry: dt.date, target_premium: float) -> dict:
