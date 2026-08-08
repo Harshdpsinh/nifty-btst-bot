@@ -1,27 +1,21 @@
 name: Daily BTST Trading Engine
 
-# GitHub's scheduled-workflow queue is best-effort: runs are routinely delayed
-# by 30-120 minutes and are sometimes dropped entirely. Observed on this repo:
-# 4 of 8 expected runs fired on 2026-07-29, and the 15:20 IST entry scan
-# actually executed at 17:20 IST.
+# The schedule trigger is DELIBERATELY REMOVED. The bot now runs on a real
+# VM (see deploy/oracle_vm_setup.sh + README's "Running on your own server")
+# with actual per-second cron and a tick-level watcher for exits. Running
+# this workflow's schedule at the same time caused duplicate/conflicting
+# notifications and false "entry window missed" alerts in production: this
+# workflow has its own separate `state.json` (committed to the repo) that
+# never sees the VM's state, and DATA_PROVIDER here defaults to `yahoo`
+# (see the vars.DATA_PROVIDER fallback below) rather than the VM's angelone
+# config — so a scheduled run here would independently re-decide entry/exit
+# from stale state and a different data feed, racing the VM's own decision.
 #
-# Two mitigations, both required:
-#   1. Schedule redundantly here, so a dropped run is covered by the next one.
-#   2. Let btst_engine.py decide what to do from the real IST clock and its
-#      state file, so extra wake-ups are harmless and a late one can never
-#      emit a tradeable signal after the window has closed.
+# workflow_dispatch is kept for occasional manual checks (e.g. selftest)
+# ONLY — never re-add a `schedule:` trigger here while the VM is the live
+# deployment, or this conflict comes back immediately.
 
 on:
-  schedule:
-    # All cron times are UTC. IST = UTC + 5:30.
-    # 30m exit monitor — 09:30 to 15:15 IST, every 15 min (2x redundancy per
-    # 30m candle; the engine posts one status per completed candle).
-    - cron: '*/15 4-9 * * 1-5'
-    # Entry scan attempts — 15:18, 15:21, 15:24, 15:27 IST.
-    - cron: '48,51,54,57 9 * * 1-5'
-    # Late catch-all — 15:35 IST. Reports a *missed* window if none of the
-    # above survived; never emits a buy signal this late.
-    - cron: '5 10 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
