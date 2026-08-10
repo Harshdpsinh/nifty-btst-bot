@@ -320,7 +320,51 @@ Do not carry this position into a second night.""")
     return True
 
 
-def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None) -> tuple[_CandleAccumulator, dict]:
+# A stuck watcher that fails silently for days is exactly what happened in
+# production (a stale Angel One session token, retried forever with no
+# alert). These two thresholds turn sustained failures into a Telegram
+# alert instead of a silent log line nobody's watching.
+ALERT_AFTER_FAILURES = 3          # consecutive failures before the first alert
+ALERT_COOLDOWN_SECONDS = 1800     # don't re-alert more often than this while still stuck
+
+
+@dataclasses.dataclass
+class _HealthTracker:
+    consecutive_failures: int = 0
+    last_alert: dt.datetime | None = None
+
+
+def _record_failure(health: _HealthTracker, reason: str, now: dt.datetime) -> None:
+    health.consecutive_failures += 1
+    if health.consecutive_failures < ALERT_AFTER_FAILURES:
+        return
+    if health.last_alert is not None and (now - health.last_alert).total_seconds() < ALERT_COOLDOWN_SECONDS:
+        return
+    engine.send_telegram(f"""⚠️ BTST WATCHER STUCK
+Time: {engine._stamp(now)}
+
+The tick-level watcher has failed {health.consecutive_failures} times in a row:
+{reason}
+
+It keeps retrying automatically, and this alert repeats every \
+{ALERT_COOLDOWN_SECONDS // 60} min while it stays broken — but exit \
+monitoring is NOT running right now. Check watcher.log on the VM.""")
+    health.last_alert = now
+
+
+def _record_success(health: _HealthTracker, now: dt.datetime) -> None:
+    if health.consecutive_failures >= ALERT_AFTER_FAILURES:
+        engine.send_telegram(f"""✅ BTST WATCHER RECOVERED
+Time: {engine._stamp(now)}
+
+Exit monitoring is working again after {health.consecutive_failures} \
+failed attempts.""")
+    health.consecutive_failures = 0
+    health.last_alert = None
+
+
+def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
+                   health: _HealthTracker) -> tuple[_CandleAccumulator, dict]:
     """last_status_bucket is deliberately NOT passed as an in-memory
     parameter — it's read from and written to state["watcher_last_status_bucket"]
     instead, so a crash-loop within the same candle can't resend duplicate
@@ -341,11 +385,15 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None) -> tuple[_C
             try:
                 acc, refs = bootstrap(now.date())
             except engine.StaleDataError as e:
+                # Holiday / market not open long enough yet for a candle —
+                # expected and quiet, doesn't count as a failure.
                 log.warning("Bootstrap skipped (will retry next tick): %s", e)
                 return acc, refs
             except Exception as e:
                 log.warning("Bootstrap failed (will retry next tick): %s", e)
+                _record_failure(health, f"Bootstrap: {type(e).__name__}: {e}", now)
                 return acc, refs
+            _record_success(health, now)
 
             bucket_key = acc.bucket_start.isoformat()
             if state.get("watcher_last_status_bucket") != bucket_key and (position or engine.STATUS_WHEN_FLAT):
@@ -363,7 +411,9 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None) -> tuple[_C
             ltp = engine.PROVIDER.get_index_ltp()
         except Exception as e:
             log.warning("Index LTP tick failed (will retry next tick): %s", e)
+            _record_failure(health, f"Index LTP: {type(e).__name__}: {e}", now)
             return acc, refs
+        _record_success(health, now)
         acc.tick(ltp)
 
         _handle_partial_profit(position, now)
@@ -381,6 +431,7 @@ def main() -> int:
 
     acc: _CandleAccumulator | None = None
     refs: dict | None = None
+    health = _HealthTracker()
     idle_iterations = 0
 
     while True:
@@ -391,6 +442,7 @@ def main() -> int:
         )
         if not (_capable() and in_window):
             acc = None  # force a fresh bootstrap whenever we re-enter the window
+            health = _HealthTracker()  # a stale failure streak shouldn't carry into tomorrow
             if idle_iterations % CAPABILITY_LOG_EVERY == 0:
                 reason = "provider has no live LTP support" if not _capable() else "outside market hours"
                 log.info("Idle (%s) — sleeping %ds.", reason, IDLE_SLEEP_SECONDS)
@@ -400,9 +452,10 @@ def main() -> int:
 
         idle_iterations = 0
         try:
-            acc, refs = _run_one_tick(acc, refs)
-        except Exception:
+            acc, refs = _run_one_tick(acc, refs, health)
+        except Exception as e:
             log.exception("Unhandled error in watcher tick — continuing.")
+            _record_failure(health, f"Tick loop: {type(e).__name__}: {e}", now)
         time.sleep(POLL_SECONDS)
 
 
