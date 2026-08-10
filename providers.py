@@ -237,6 +237,17 @@ class AngelOneProvider(MarketDataProvider):
                 resp.raise_for_status()
                 body = resp.json()
                 if not body.get("status"):
+                    # SmartAPI reports some auth failures (e.g. an expired
+                    # session) as HTTP 200 with status:false/"Invalid Token"
+                    # in the body, not a 401 -- confirmed against a real
+                    # account, where this left a multi-day-old watcher
+                    # process spinning on the same dead token forever,
+                    # since the 401 branch above never triggered. Clear the
+                    # token on ANY failure so the next retry attempt forces
+                    # a fresh login rather than hammering a token that may
+                    # be dead — cheap and safe even when the failure wasn't
+                    # auth-related.
+                    self._jwt_token = None
                     raise ProviderError(f"Angel One request to {path} failed: {body.get('message', body)}")
                 return body
             except Exception as e:
