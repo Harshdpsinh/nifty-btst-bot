@@ -146,10 +146,11 @@ def bootstrap(today: dt.date) -> tuple[_CandleAccumulator, dict]:
     bucket rollover. Returns (accumulator for the still-forming bucket,
     {"red": most_recent_closed_red_row_or_None, "green": ...}).
     """
-    ha_df = engine.calculate_30m_heikin_ashi_for_day(today)
+    ha_df, prev_session_row = engine.calculate_30m_heikin_ashi_day_and_prev(today)
     latest = ha_df.iloc[-1]
     closed = ha_df.iloc[:-1]
 
+    # References may ONLY be chosen from today's own closed candles.
     refs: dict = {"red": None, "green": None}
     for _, row in closed.iterrows():
         if row["Is_Red"]:
@@ -157,12 +158,20 @@ def bootstrap(today: dt.date) -> tuple[_CandleAccumulator, dict]:
         elif row["Is_Green"]:
             refs["green"] = row
 
+    # Seeding the forming bucket is a separate concern from reference
+    # selection, and Heikin-Ashi is recursive, so the seed must come from
+    # whatever candle actually precedes this one -- including yesterday's
+    # close when today's first candle is still forming. Seeding from
+    # (Open+Close)/2 instead silently diverges from the chart across an
+    # overnight gap and can flip the candle's colour.
     if len(closed) > 0:
         seed_open = float(closed.iloc[-1]["HA_Open"])
         seed_close = float(closed.iloc[-1]["HA_Close"])
+    elif prev_session_row is not None:
+        seed_open = float(prev_session_row["HA_Open"])
+        seed_close = float(prev_session_row["HA_Close"])
     else:
-        # First candle of the day: same seed rule _heikin_ashi() itself uses
-        # for its own first row -- there is no "previous candle" yet.
+        # Genuinely no prior candle in the lookback window at all.
         seed_open = (float(latest["Open"]) + float(latest["Close"])) / 2.0
         seed_close = seed_open
 

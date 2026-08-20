@@ -252,9 +252,15 @@ def get_live_daily_data() -> tuple[float, float]:
 def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     """Compute HA columns for a raw OHLC frame, seeded fresh from the
     frame's own first row. Shared by the multi-day series (diagnostics) and
-    the day-filtered series (exit monitoring — see the docstring on
-    calculate_30m_heikin_ashi_for_day for why exit monitoring needs its own
-    independently-seeded series rather than a continuation from a prior day).
+    the day-filtered view used for exit monitoring.
+
+    Heikin-Ashi is a RECURSIVE series: HA_Open[i] depends on HA_Open[i-1],
+    so it must always be computed over a continuous multi-day window and
+    only THEN sliced to a single day. Computing it from a day's bars in
+    isolation re-seeds HA_Open to (Open+Close)/2 of that day's first
+    candle, which silently produces different values — and different
+    CANDLE COLOURS — from every charting platform. See
+    calculate_30m_heikin_ashi_for_day.
     """
     ha = df.copy()
     ha["HA_Close"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4.0
@@ -289,13 +295,45 @@ def calculate_30m_heikin_ashi() -> pd.DataFrame:
 
 
 def calculate_30m_heikin_ashi_for_day(day: dt.date) -> pd.DataFrame:
-    """Build 30m Heikin-Ashi candles using ONLY `day`'s own bars — a fresh,
-    independently-seeded series, never a continuation from any prior day
-    (including the entry day). Exit monitoring must only ever consider the
-    candles of the day actually being watched.
+    """Return ONLY `day`'s 30m Heikin-Ashi candles, computed from the full
+    continuous multi-day series and sliced afterwards.
+
+    The slicing happens AFTER the HA math, never before. Heikin-Ashi is
+    recursive (HA_Open[i] = (HA_Open[i-1] + HA_Close[i-1]) / 2), so a
+    series seeded fresh each morning diverges from what TradingView / the
+    broker chart draws — most visibly on a gap day, where the true
+    continuous HA_Open carries over from the previous session's close
+    while a fresh seed snaps to (Open+Close)/2 of the first candle. That
+    difference flips candle colours, and a flipped colour arms the wrong
+    exit level (or none at all). Confirmed in production on 2026-08-20:
+    the 09:15 candle rendered GREEN on the chart but the bot reported RED,
+    leaving a live PE position with no armed exit.
+
+    The user's rule — "only the exit day's candles count" — is about which
+    candles may be CHOSEN as the reference, and that is preserved: the
+    returned frame contains only `day`'s rows. It was never a statement
+    about how the HA arithmetic itself should be seeded.
+    """
+    return calculate_30m_heikin_ashi_day_and_prev(day)[0]
+
+
+def calculate_30m_heikin_ashi_day_and_prev(day: dt.date) -> tuple[pd.DataFrame, "pd.Series | None"]:
+    """`day`'s HA rows plus the HA row immediately BEFORE them (normally the
+    previous session's closing candle, or None if the lookback window
+    doesn't reach that far).
+
+    The second value is what correctly seeds a still-forming first candle
+    of the day: HA_Open for it is (prev_HA_Open + prev_HA_Close) / 2, which
+    carries over across the overnight gap exactly as a chart draws it.
+    watcher.py needs this because at, say, 09:20 there are no closed
+    candles today yet, so there is nothing within `day` itself to seed from.
     """
     df = PROVIDER.intraday_bars(SYMBOL, INTRADAY_INTERVAL_MIN, INTRADAY_LOOKBACK_DAYS)
-    day_df = df[df.index.date == day]
+    if len(df) < 2:
+        raise ValueError("Need at least two 30m candles to evaluate exits.")
+
+    full = _heikin_ashi(df)                      # continuous, multi-day
+    day_df = full[full.index.date == day]        # sliced only AFTER the HA math
     if day_df.empty:
         raise StaleDataError(f"No 30m candle data for {day} in the fetched window yet.")
 
@@ -303,7 +341,9 @@ def calculate_30m_heikin_ashi_for_day(day: dt.date) -> pd.DataFrame:
     if age_min > MAX_INTRADAY_STALENESS_MIN:
         raise StaleDataError(f"Latest 30m candle for {day} is {age_min:.0f} min old — feed lagging.")
 
-    return _heikin_ashi(day_df)
+    first_pos = full.index.get_loc(day_df.index[0])
+    prev_row = full.iloc[first_pos - 1] if first_pos > 0 else None
+    return day_df, prev_row
 
 
 # ---------------------------- messages ----------------------------
