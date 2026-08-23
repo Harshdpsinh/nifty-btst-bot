@@ -34,6 +34,7 @@ import logging
 import os
 import pathlib
 import sys
+import time
 
 import pandas as pd
 import pytz
@@ -83,6 +84,8 @@ INTRADAY_INTERVAL_MIN = 30
 MAX_INTRADAY_STALENESS_MIN = 90      # data-freshness guard, not a strategy rule
 REQUEST_TIMEOUT = 10
 TELEGRAM_MAX_CHARS = 4096
+TELEGRAM_SEND_RETRIES = 3
+TELEGRAM_RETRY_BACKOFF_SEC = 2
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -159,23 +162,38 @@ def send_telegram(message: str) -> bool:
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        body = resp.json()
-        if not body.get("ok"):
-            raise ValueError(f"Telegram replied ok=false: {body}")
-        log.info("Telegram delivered (%d chars, message_id=%s).",
-                 len(message), body.get("result", {}).get("message_id"))
-        return True
-    except (requests.RequestException, ValueError) as e:
-        detail = ""
-        resp_obj = getattr(e, "response", None)
-        if resp_obj is not None:
-            detail = f" | response: {resp_obj.text[:300]}"
-        log.error("Telegram send FAILED: %s%s\nMessage was:\n%s", e, detail, message)
-        _send_failures += 1
-        return False
+
+    # Retry transient failures. Observed in production on 2026-08-20:
+    # "[Errno 101] Network is unreachable" for a single moment lost that
+    # 30-minute status update outright. Callers additionally treat a False
+    # return as "not delivered" and leave their state untouched so the
+    # message is retried later -- see the gating at every call site.
+    last_err: Exception | None = None
+    for attempt in range(1, TELEGRAM_SEND_RETRIES + 1):
+        try:
+            resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            body = resp.json()
+            if not body.get("ok"):
+                raise ValueError(f"Telegram replied ok=false: {body}")
+            log.info("Telegram delivered (%d chars, message_id=%s).",
+                     len(message), body.get("result", {}).get("message_id"))
+            return True
+        except (requests.RequestException, ValueError) as e:
+            last_err = e
+            detail = ""
+            resp_obj = getattr(e, "response", None)
+            if resp_obj is not None:
+                detail = f" | response: {resp_obj.text[:300]}"
+            log.warning("Telegram send attempt %d/%d failed: %s%s",
+                        attempt, TELEGRAM_SEND_RETRIES, e, detail)
+            if attempt < TELEGRAM_SEND_RETRIES:
+                time.sleep(TELEGRAM_RETRY_BACKOFF_SEC * attempt)
+
+    log.error("Telegram send FAILED after %d attempts: %s\nMessage was:\n%s",
+              TELEGRAM_SEND_RETRIES, last_err, message)
+    _send_failures += 1
+    return False
 
 
 # ------------------------------ state ------------------------------
@@ -514,8 +532,14 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
         expiry_date, expiry_label = _next_option_expiry(now.date())
         expiry_rolled = now.weekday() in (0, 1)
         contract = _resolve_contract(side, expiry_date)
-        send_telegram(_signal_message(side, now_ist, live_spot, ha_close, divergence,
-                                       expiry_date, expiry_label, expiry_rolled, contract))
+        # Record the position ONLY if the buy signal actually reached the
+        # user. Otherwise the bot would track a trade they were never told
+        # to place -- and then send exit alerts for it tomorrow. Leaving
+        # entry_scan_date unset lets a later run inside the window retry.
+        if not send_telegram(_signal_message(side, now_ist, live_spot, ha_close, divergence,
+                                              expiry_date, expiry_label, expiry_rolled, contract)):
+            log.error("BUY signal UNDELIVERED — no position recorded, will retry in-window.")
+            return
         state["position"] = {
             "side": side,
             "entry_spot": round(live_spot, 2),
@@ -536,7 +560,9 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
                   side, live_spot, expiry_date.isoformat(), expiry_label,
                   contract["tradingsymbol"] if contract else "unresolved")
     else:
-        send_telegram(_no_trade_message(now_ist, live_spot, ha_close, divergence))
+        if not send_telegram(_no_trade_message(now_ist, live_spot, ha_close, divergence)):
+            log.error("NO-TRADE notice UNDELIVERED — will retry in-window.")
+            return
         state["position"] = None
 
     state["entry_scan_date"] = today
