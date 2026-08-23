@@ -283,7 +283,12 @@ def _handle_partial_profit(position: dict, now: dt.datetime) -> bool:
         return False
     target = position["entry_premium"] * engine.PARTIAL_PROFIT_MULTIPLIER
     if ltp >= target:
-        engine.send_telegram(_partial_profit_message(position, ltp, engine._stamp(now)))
+        # Only mark it booked if the alert actually reached the user. On a
+        # failed send, leave the flag alone so the next tick re-fires it --
+        # marking it booked would silently swallow the instruction to sell.
+        if not engine.send_telegram(_partial_profit_message(position, ltp, engine._stamp(now))):
+            log.error("Partial-profit alert UNDELIVERED — will retry next tick.")
+            return False
         position["partial_booked"] = True
         log.info("Partial profit booked: %s ltp=%.2f target=%.2f", position["side"], ltp, target)
         return True
@@ -297,16 +302,24 @@ def _handle_full_exit(state: dict, position: dict, acc: _CandleAccumulator, refs
     side = position["side"]
     now_time = engine._stamp(now)
 
+    # Clearing the position on an UNDELIVERED exit alert is the worst failure
+    # this bot can have: the user keeps holding a live trade while the bot
+    # believes it is flat, and never sends the signal again. Always gate the
+    # clear on delivery; an undelivered alert simply re-fires next tick.
     if side == "CE" and refs["red"] is not None and ha_low < refs["red"]["HA_Low"]:
-        engine.send_telegram(_full_exit_message(
-            position, "CE", now_time, refs["red"], "HA_Low", ha_low, "👇"))
+        if not engine.send_telegram(_full_exit_message(
+                position, "CE", now_time, refs["red"], "HA_Low", ha_low, "👇")):
+            log.error("CE EXIT alert UNDELIVERED — position kept open, retrying next tick.")
+            return False
         state["position"] = None
         log.info("Full CE exit fired: live_ha_low=%.2f ref=%.2f", ha_low, refs["red"]["HA_Low"])
         return True
 
     if side == "PE" and refs["green"] is not None and ha_high > refs["green"]["HA_High"]:
-        engine.send_telegram(_full_exit_message(
-            position, "PE", now_time, refs["green"], "HA_High", ha_high, "👆"))
+        if not engine.send_telegram(_full_exit_message(
+                position, "PE", now_time, refs["green"], "HA_High", ha_high, "👆")):
+            log.error("PE EXIT alert UNDELIVERED — position kept open, retrying next tick.")
+            return False
         state["position"] = None
         log.info("Full PE exit fired: live_ha_high=%.2f ref=%.2f", ha_high, refs["green"]["HA_High"])
         return True
@@ -317,13 +330,18 @@ def _handle_full_exit(state: dict, position: dict, acc: _CandleAccumulator, refs
 def _hard_cutoff(state: dict, position: dict, now: dt.datetime) -> bool:
     if now.time() < engine.HARD_EXIT_TIME:
         return False
-    engine.send_telegram(f"""⏰ TIME CUTOFF REACHED ({engine.HARD_EXIT_TIME.strftime('%I:%M %p')} IST)
+    if not engine.send_telegram(f"""⏰ TIME CUTOFF REACHED ({engine.HARD_EXIT_TIME.strftime('%I:%M %p')} IST)
 Asset: NIFTY 50
 Open position: {position['side']} opened {position.get('opened_at', 'unknown')}
 
 ⚡ ACTION REQUIRED:
 Square off ALL remaining open lots immediately!
-Do not carry this position into a second night.""")
+Do not carry this position into a second night."""):
+        # Undelivered: keep the position so the next tick re-sends. Returning
+        # True still short-circuits the rest of the tick, which is correct --
+        # past the cutoff there is nothing else to do but get this message out.
+        log.error("TIME CUTOFF alert UNDELIVERED — position kept, retrying next tick.")
+        return True
     state["position"] = None
     log.info("Hard cutoff square-off fired.")
     return True
@@ -428,11 +446,15 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
             bucket_key = acc.bucket_start.isoformat()
             if state.get("watcher_last_status_bucket") != bucket_key and (position or engine.STATUS_WHEN_FLAT):
                 ha_open, ha_close, ha_high, ha_low = acc.live_ha()
-                engine.send_telegram(_status_message(
-                    now.strftime("%H:%M IST"), position, ha_open, ha_close, ha_high, ha_low,
-                    acc.close, refs,
-                ))
-                state["watcher_last_status_bucket"] = bucket_key
+                # Advance the dedup key ONLY on a delivered message. Marking
+                # the bucket as sent after a failed send is what silently
+                # dropped the 14:45 status on 2026-08-20.
+                if engine.send_telegram(_status_message(
+                        now.strftime("%H:%M IST"), position, ha_open, ha_close, ha_high, ha_low,
+                        acc.close, refs)):
+                    state["watcher_last_status_bucket"] = bucket_key
+                else:
+                    log.error("Status update UNDELIVERED — will retry next tick.")
 
         if not position:
             return acc, refs
