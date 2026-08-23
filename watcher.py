@@ -336,11 +336,20 @@ Do not carry this position into a second night.""")
 ALERT_AFTER_FAILURES = 3          # consecutive failures before the first alert
 ALERT_COOLDOWN_SECONDS = 1800     # don't re-alert more often than this while still stuck
 
+# Escalating wait before RETRYING a failed bootstrap. Without this, a failed
+# bootstrap is retried every POLL_SECONDS, and each retry burns RETRIES HTTP
+# calls -- roughly 675 getCandleData calls/hour. Angel One rate-limits that
+# endpoint, so the storm sustains the very 403 it is reacting to: observed in
+# production on 2026-08-20, where transient 403s escalated into a permanent
+# one and every status update stopped for the rest of the session.
+BOOTSTRAP_BACKOFF_SECONDS = (30, 60, 120, 300, 600)
+
 
 @dataclasses.dataclass
 class _HealthTracker:
     consecutive_failures: int = 0
     last_alert: dt.datetime | None = None
+    next_bootstrap_at: dt.datetime | None = None
 
 
 def _record_failure(health: _HealthTracker, reason: str, now: dt.datetime) -> None:
@@ -370,6 +379,7 @@ Exit monitoring is working again after {health.consecutive_failures} \
 failed attempts.""")
     health.consecutive_failures = 0
     health.last_alert = None
+    health.next_bootstrap_at = None
 
 
 def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
@@ -391,15 +401,26 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
         current_bucket = _bucket_start(now)
         rolled_over = acc is None or current_bucket != acc.bucket_start
         if rolled_over:
+            # Respect the post-failure backoff. Retrying a failed bootstrap
+            # every tick hammers a rate-limited endpoint and keeps it failing.
+            if health.next_bootstrap_at is not None and now < health.next_bootstrap_at:
+                return acc, refs
             try:
                 acc, refs = bootstrap(now.date())
             except engine.StaleDataError as e:
                 # Holiday / market not open long enough yet for a candle —
-                # expected and quiet, doesn't count as a failure.
-                log.warning("Bootstrap skipped (will retry next tick): %s", e)
+                # expected and quiet, doesn't count as a failure. Still back
+                # off: re-asking every 10s for a candle that cannot exist yet
+                # burns the same rate limit as a hard failure does.
+                log.warning("Bootstrap skipped (backing off): %s", e)
+                health.next_bootstrap_at = now + dt.timedelta(
+                    seconds=BOOTSTRAP_BACKOFF_SECONDS[0])
                 return acc, refs
             except Exception as e:
-                log.warning("Bootstrap failed (will retry next tick): %s", e)
+                idx = min(health.consecutive_failures, len(BOOTSTRAP_BACKOFF_SECONDS) - 1)
+                delay = BOOTSTRAP_BACKOFF_SECONDS[idx]
+                health.next_bootstrap_at = now + dt.timedelta(seconds=delay)
+                log.warning("Bootstrap failed (retrying in %ds): %s", delay, e)
                 _record_failure(health, f"Bootstrap: {type(e).__name__}: {e}", now)
                 return acc, refs
             _record_success(health, now)
