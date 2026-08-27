@@ -66,8 +66,15 @@ path. `workflow_dispatch` / `selftest` is optional.
 7. **Stale feed inside 15:18–15:28 retries**; it does not burn the whole day.
 8. **LTP 0 strikes are ignored.** JWT is cleared only on real auth errors, not on candle 403s.
 9. File lock + atomic `state.json` write shared by cron and watcher.
+10. **The exit session is stamped before the feed call**, not after. A dead feed
+    or an undelivered 15:13 cutoff used to leave `exit_session_date` empty, so
+    the leftover guard saw nothing and the trade quietly got a second night.
+11. **A Telegram blip no longer silences the "watcher is down" warning** for the
+    rest of the day — the once-a-day flag is only burned if the alert landed.
 
-Offline checks: `python test_playbook_guards.py` (16 tests).
+Offline checks: `python test_playbook_guards.py` (22 tests). They also run in
+GitHub Actions on every push (`.github/workflows/tests.yml`) — green there means
+the guards still hold before you pull to the VM.
 
 ## Setup (new VM)
 

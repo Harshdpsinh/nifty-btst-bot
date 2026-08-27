@@ -206,5 +206,112 @@ class ExpiryRuleTests(unittest.TestCase):
         self.assertEqual(d_wed, dt.date(2026, 9, 1))
 
 
+class ExitSessionStampTests(unittest.TestCase):
+    """The 'never two nights' guard only holds if exit_session_date is stamped
+    on the exit day even when the feed is dead or Telegram is down."""
+
+    @staticmethod
+    def _yesterdays_position():
+        return {
+            "side": "CE",
+            "opened_date": "2026-08-26",
+            "opened_at": "yesterday 15:22",
+            "entry_spot": 24500.0,
+        }
+
+    def test_stale_feed_still_stamps_the_exit_session(self):
+        state = {"position": self._yesterdays_position()}
+        fake_now = IST.localize(dt.datetime(2026, 8, 27, 11, 0))
+        with mock.patch.object(engine, "_now", return_value=fake_now), mock.patch.object(
+            engine, "send_telegram", return_value=True
+        ), mock.patch.object(
+            engine, "calculate_30m_heikin_ashi_for_day",
+            side_effect=engine.StaleDataError("feed dead all day"),
+        ):
+            engine.run_exit_scan(state)
+        self.assertEqual(state["position"]["exit_session_date"], "2026-08-27")
+        # Tomorrow it is a leftover, so it gets a square-off alert, not another night.
+        self.assertTrue(
+            engine.is_leftover_position(state["position"], dt.date(2026, 8, 28))
+        )
+
+    def test_undelivered_cutoff_still_stamps_the_exit_session(self):
+        state = {"position": self._yesterdays_position()}
+        fake_now = IST.localize(dt.datetime(2026, 8, 27, 15, 14))
+        with mock.patch.object(engine, "_now", return_value=fake_now), mock.patch.object(
+            engine, "send_telegram", return_value=False
+        ):
+            engine.run_exit_scan(state)
+        self.assertIsNotNone(state["position"])  # not cleared — alert never landed
+        self.assertEqual(state["position"]["exit_session_date"], "2026-08-27")
+        self.assertTrue(
+            engine.is_leftover_position(state["position"], dt.date(2026, 8, 28))
+        )
+
+    def test_same_day_position_is_never_stamped(self):
+        state = {
+            "position": {
+                "side": "PE",
+                "opened_date": "2026-08-27",
+                "opened_at": "today 15:22",
+            }
+        }
+        fake_now = IST.localize(dt.datetime(2026, 8, 27, 11, 0))
+        with mock.patch.object(engine, "_now", return_value=fake_now), mock.patch.object(
+            engine, "send_telegram", return_value=True
+        ), mock.patch.object(
+            engine, "calculate_30m_heikin_ashi_for_day",
+            side_effect=AssertionError("should not fetch for a same-day hold"),
+        ):
+            engine.run_exit_scan(state)
+        self.assertIsNone(state["position"].get("exit_session_date"))
+
+
+class WatcherDownAlertTests(unittest.TestCase):
+    """A Telegram blip must not silence the once-a-day 'watcher is down' warning."""
+
+    @staticmethod
+    def _stale_heartbeat_state():
+        return {
+            "position": None,
+            "watcher_heartbeat": IST.localize(
+                dt.datetime(2026, 8, 27, 9, 0)
+            ).isoformat(),
+        }
+
+    def test_flag_not_burned_when_alert_undelivered(self):
+        state = self._stale_heartbeat_state()
+        fake_now = IST.localize(dt.datetime(2026, 8, 27, 11, 0))
+        with mock.patch.object(engine, "_now", return_value=fake_now), mock.patch.object(
+            engine, "send_telegram", return_value=False
+        ), mock.patch.object(engine, "run_exit_scan"):
+            engine.run_auto(state)
+        self.assertIsNone(state.get("watcher_down_alert_date"))
+
+    def test_flag_burned_once_when_delivered(self):
+        state = self._stale_heartbeat_state()
+        fake_now = IST.localize(dt.datetime(2026, 8, 27, 11, 0))
+        with mock.patch.object(engine, "_now", return_value=fake_now), mock.patch.object(
+            engine, "send_telegram", return_value=True
+        ), mock.patch.object(engine, "run_exit_scan"):
+            engine.run_auto(state)
+        self.assertEqual(state.get("watcher_down_alert_date"), "2026-08-27")
+
+    def test_restored_flag_kept_when_notice_undelivered(self):
+        state = {
+            "position": None,
+            "watcher_heartbeat": IST.localize(
+                dt.datetime(2026, 8, 27, 10, 59, 30)
+            ).isoformat(),
+            "watcher_down_alert_date": "2026-08-27",
+        }
+        fake_now = IST.localize(dt.datetime(2026, 8, 27, 11, 0))
+        with mock.patch.object(engine, "_now", return_value=fake_now), mock.patch.object(
+            engine, "send_telegram", return_value=False
+        ):
+            engine.run_auto(state)
+        self.assertEqual(state.get("watcher_down_alert_date"), "2026-08-27")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

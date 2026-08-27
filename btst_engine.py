@@ -695,6 +695,14 @@ def run_exit_scan(state: dict, force: bool = False) -> None:
         _try_clear_position(state, leftover_message(position, _stamp(now)))
         return
 
+    # Stamp the exit session the moment we know today is it — BEFORE the feed
+    # call and BEFORE the cutoff. If it were stamped only after a successful
+    # candle fetch, a day of stale data (or an undelivered cutoff) would leave
+    # exit_session_date empty, is_leftover_position() would say False tomorrow,
+    # and the position would quietly get a second night.
+    if position and not is_same_day_position(position, today):
+        mark_exit_session(position, today)
+
     if now.time() >= HARD_EXIT_TIME and not force:
         if not position:
             log.info("Past hard exit time and no open position — nothing to do.")
@@ -717,9 +725,6 @@ def run_exit_scan(state: dict, force: bool = False) -> None:
             f"Time: {now_time}\n{type(e).__name__}: {e}"
         )
         return
-
-    if position:
-        mark_exit_session(position, today)
 
     closed, forming = split_closed_and_forming(ha_df, now)
     latest = forming if forming is not None else (ha_df.iloc[-1] if not ha_df.empty else None)
@@ -859,17 +864,19 @@ def run_auto(state: dict) -> None:
         if watcher_heartbeat_fresh(state, now):
             log.info("Watcher heartbeat fresh — cron leaves exits to watcher.py.")
             if state.get("watcher_down_alert_date") == now.date().isoformat():
-                send_telegram(
+                if send_telegram(
                     f"✅ BTST WATCHER HEARTBEAT RESTORED\nTime: {_stamp(now)}\n\n"
                     "Tick-level exit monitoring is running again. Cron stepping aside."
-                )
-                state["watcher_down_alert_date"] = None
+                ):
+                    state["watcher_down_alert_date"] = None
+                else:
+                    log.error("Watcher-restored notice UNDELIVERED — flag kept, will retry.")
             return
         # Watcher down: cron must cover HA exits or a live position is unwatched.
         if t >= EXIT_MONITOR_FROM or leftover:
             today = now.date().isoformat()
             if state.get("watcher_down_alert_date") != today:
-                send_telegram(
+                delivered = send_telegram(
                     f"""⚠️ WATCHER HEARTBEAT MISSING
 Time: {_stamp(now)}
 
@@ -880,7 +887,14 @@ On the VM check:
   sudo systemctl status btst-watcher
   tail -50 ~/nifty-btst-bot/watcher.log"""
                 )
-                state["watcher_down_alert_date"] = today
+                # Only burn the once-a-day flag if the warning actually landed.
+                # Otherwise a Telegram blip silences the "watcher is down"
+                # alert for the whole session — the exact failure mode that
+                # made this bot go quiet for days.
+                if delivered:
+                    state["watcher_down_alert_date"] = today
+                else:
+                    log.error("Watcher-down alert UNDELIVERED — will retry next cron tick.")
             log.warning("Watcher heartbeat stale — cron running exit scan as fallback.")
             run_exit_scan(state)
         else:

@@ -341,6 +341,13 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
             log.info("Same-day position — overnight hold, watcher not exiting.")
             return acc, refs
 
+        # Today is this position's one exit session. Stamp it now, before the
+        # cutoff and before any candle fetch — stamping later meant a stale
+        # feed or an undelivered cutoff left exit_session_date empty and the
+        # leftover guard let the trade run a second night.
+        if position:
+            engine.mark_exit_session(position, today)
+
         if position and _hard_cutoff(state, position, now):
             return acc, refs
 
@@ -370,9 +377,6 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
                 _record_failure(health, f"Bootstrap: {type(e).__name__}: {e}", now)
                 return acc, refs
             _record_success(health, now)
-
-            if position:
-                engine.mark_exit_session(position, today)
 
             bucket_key = acc.bucket_start.isoformat()
             live = acc.live_ha()
