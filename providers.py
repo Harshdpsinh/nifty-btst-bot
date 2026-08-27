@@ -1,20 +1,15 @@
-"""Market data providers behind a single interface.
+"""Market data: Angel One SmartAPI only.
 
-Switching data sources is meant to be a one-line config change, not a code
-rewrite: set the DATA_PROVIDER env var (or the DATA_PROVIDER repository
-variable in GitHub Actions settings — no push required) to one of the keys
-in _PROVIDERS below.
+Yahoo was removed — a 15-minute delayed unofficial feed cannot be trusted
+for an 11-point NIFTY divergence. DATA_PROVIDER is ignored except that
+`yahoo` fails loudly so a leftover env var is obvious.
 
-    DATA_PROVIDER=yahoo      (default; free, no account, ~15 min delayed)
-    DATA_PROVIDER=angelone   (free with an Angel One account, official
-                              real-time NSE data via SmartAPI)
+Required env vars (also GitHub Actions secrets / ~/.btst.env on the VM):
+  ANGELONE_API_KEY, ANGELONE_CLIENT_ID, ANGELONE_PASSWORD, ANGELONE_TOTP_SECRET
 
-Every provider returns the same shape: a pandas DataFrame with columns
-Open/High/Low/Close, indexed by tz-aware IST timestamps, newest bar last
-(the newest bar may still be "forming" — that's the live price the entry
-scan relies on). All Heikin-Ashi math, staleness checks and divergence
-calculations live in btst_engine.py and are identical regardless of which
-provider produced the bars.
+Optional:
+  ANGELONE_SYMBOL_TOKEN  — NSE token for Nifty 50 (default 99926000)
+  ANGELONE_BASE_URL      — default https://apiconnect.angelone.in
 """
 
 from __future__ import annotations
@@ -59,100 +54,39 @@ def _localize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-class YahooProvider(MarketDataProvider):
-    """Free, no account required. Unofficial and roughly 15 min delayed for
-    NSE data — fine for exploring the strategy, not for the live entry
-    decision where the divergence threshold is only 11 points.
-    """
-
-    name = "yahoo"
-    RETRIES = 3
-    BACKOFF_SEC = 2
-
-    def __init__(self) -> None:
-        import yfinance as yf  # imported lazily so other providers don't need it
-        self._yf = yf
-
-    def _download(self, symbol: str, period: str, interval: str) -> pd.DataFrame:
-        last_err: Exception | None = None
-        for attempt in range(1, self.RETRIES + 1):
-            try:
-                df = self._yf.download(
-                    symbol, period=period, interval=interval,
-                    progress=False, auto_adjust=False,
-                )
-                if df is not None and not df.empty:
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                    return _localize(df)
-                last_err = ProviderError("Yahoo Finance returned an empty frame")
-            except Exception as e:  # network/parse errors from yfinance
-                last_err = e
-            log.warning("Yahoo download attempt %d/%d failed: %s",
-                        attempt, self.RETRIES, last_err)
-            if attempt < self.RETRIES:
-                time.sleep(self.BACKOFF_SEC * attempt)
-        raise ProviderError(f"Failed to fetch {symbol} {interval} from Yahoo: {last_err}")
-
-    def daily_bars(self, symbol: str, lookback_days: int) -> pd.DataFrame:
-        return self._download(symbol, f"{lookback_days}d", "1d")
-
-    def intraday_bars(self, symbol: str, interval_minutes: int, lookback_days: int) -> pd.DataFrame:
-        return self._download(symbol, f"{lookback_days}d", f"{interval_minutes}m")
+def _is_auth_error_message(message: str) -> bool:
+    """True only for session/token failures — not for 403 rate limits, etc."""
+    m = (message or "").lower()
+    needles = (
+        "invalid token",
+        "token expired",
+        "jwt",
+        "unauthorized",
+        "unauthorised",
+        "session expired",
+        "please login",
+        "not logged in",
+        "invalid session",
+        "access denied",
+    )
+    return any(n in m for n in needles)
 
 
 class AngelOneProvider(MarketDataProvider):
-    """Free with an Angel One demat account. Official real-time NSE data via
-    SmartAPI (https://smartapi.angelbroking.com): getCandleData for daily/30m
-    index candles, plus searchScrip + batch quote for resolving and pricing
-    the actual option contract bought (used by watcher.py for partial-profit
-    and tick-level exit tracking — see resolve_option_contract/get_quotes/
-    get_index_ltp/get_option_ltp below).
+    """Official real-time NSE data via SmartAPI.
 
     Required env vars / repository secrets:
-      ANGELONE_API_KEY       — generated on the SmartAPI portal after
-                                enabling the SmartAPI add-on on your account
-      ANGELONE_CLIENT_ID     — your Angel One client code (login ID)
-      ANGELONE_PASSWORD      — your account password/PIN
-      ANGELONE_TOTP_SECRET   — the base32 TOTP secret shown when you set up
-                                2FA for SmartAPI (NOT your regular OTP app
-                                code — SmartAPI needs the secret itself so it
-                                can generate its own code on every login)
+      ANGELONE_API_KEY, ANGELONE_CLIENT_ID, ANGELONE_PASSWORD, ANGELONE_TOTP_SECRET
 
-    Optional overrides:
-      ANGELONE_SYMBOL_TOKEN  — NSE instrument token for the NIFTY 50 index.
-                                Defaults to "99926000" (the commonly
-                                published token for exchange=NSE,
-                                symbol="Nifty 50"). If prices ever look like
-                                they're for the wrong instrument, look up the
-                                correct token in Angel One's scrip master
-                                (https://margincalculator.angelbroking.com/
-                                OpenAPI_File/files/OpenAPIScripMaster.json —
-                                filter exch_seg=="NSE" and symbol=="Nifty 50")
-                                and set this instead of touching code.
-      ANGELONE_BASE_URL      — defaults to https://apiconnect.angelone.in
-
-    Important caveat: unlike YahooProvider, none of this has been exercised
-    against a real Angel One account (no test credentials were available
-    when this was written) — only against the documented SmartAPI request/
-    response shape and a mocked HTTP layer (see the offline test suite).
-    Field-name casing in particular ("symboltoken" vs "symbolToken") is
-    inconsistent across SmartAPI's own docs, so get_quotes()/
-    search_option_chain() check both defensively, but a real account is the
-    only real test. Run `python btst_engine.py selftest` with
-    DATA_PROVIDER=angelone before trusting it for a live trade, and watch
-    the first live entry's contract-resolution step closely before trusting
-    watcher.py unattended. If SmartAPI's historical endpoint doesn't include
-    the still-forming candle for your account/plan, the engine's existing
-    staleness checks will raise StaleDataError and notify you rather than
-    silently trading on stale data — they don't require any Angel-One-
-    specific handling.
+    Optional:
+      ANGELONE_SYMBOL_TOKEN  — default \"99926000\" (NSE Nifty 50)
+      ANGELONE_BASE_URL      — default https://apiconnect.angelone.in
     """
 
     name = "angelone"
 
     EXCHANGE = "NSE"
-    DEFAULT_SYMBOL_TOKEN = "99926000"  # NSE:"Nifty 50" — verify if data looks wrong
+    DEFAULT_SYMBOL_TOKEN = "99926000"
     RETRIES = 3
     BACKOFF_SEC = 2
     REQUEST_TIMEOUT = 15
@@ -164,7 +98,7 @@ class AngelOneProvider(MarketDataProvider):
     }
 
     def __init__(self) -> None:
-        import pyotp  # imported lazily so YahooProvider users don't need it
+        import pyotp  # imported lazily so tests can construct without the package if needed
         self._pyotp = pyotp
 
         required = ("ANGELONE_API_KEY", "ANGELONE_CLIENT_ID",
@@ -175,7 +109,7 @@ class AngelOneProvider(MarketDataProvider):
                 "AngelOneProvider is missing: " + ", ".join(missing) + ". "
                 "Generate an API key at https://smartapi.angelbroking.com "
                 "(enable the SmartAPI add-on on your Angel One account first), "
-                "then set these as env vars or GitHub Actions secrets."
+                "then set these as env vars or in ~/.btst.env on the VM."
             )
 
         self.base_url = os.getenv("ANGELONE_BASE_URL", "https://apiconnect.angelone.in")
@@ -217,9 +151,7 @@ class AngelOneProvider(MarketDataProvider):
         log.info("Angel One SmartAPI login OK.")
 
     def _post(self, path: str, payload: dict) -> dict:
-        """POST with retry, lazy login, and a forced re-login on 401. Returns
-        the parsed JSON body. Shared by every SmartAPI call this class makes.
-        """
+        """POST with retry, lazy login, and re-login only on real auth failures."""
         url = f"{self.base_url}{path}"
         last_err: Exception | None = None
         for attempt in range(1, self.RETRIES + 1):
@@ -229,7 +161,6 @@ class AngelOneProvider(MarketDataProvider):
                 resp = requests.post(url, json=payload, headers=self._headers(authed=True),
                                       timeout=self.REQUEST_TIMEOUT)
                 if resp.status_code == 401:
-                    # Token expired or rejected — force a fresh login, retry once more.
                     self._jwt_token = None
                     self._login()
                     resp = requests.post(url, json=payload, headers=self._headers(authed=True),
@@ -237,18 +168,14 @@ class AngelOneProvider(MarketDataProvider):
                 resp.raise_for_status()
                 body = resp.json()
                 if not body.get("status"):
-                    # SmartAPI reports some auth failures (e.g. an expired
-                    # session) as HTTP 200 with status:false/"Invalid Token"
-                    # in the body, not a 401 -- confirmed against a real
-                    # account, where this left a multi-day-old watcher
-                    # process spinning on the same dead token forever,
-                    # since the 401 branch above never triggered. Clear the
-                    # token on ANY failure so the next retry attempt forces
-                    # a fresh login rather than hammering a token that may
-                    # be dead — cheap and safe even when the failure wasn't
-                    # auth-related.
-                    self._jwt_token = None
-                    raise ProviderError(f"Angel One request to {path} failed: {body.get('message', body)}")
+                    msg = str(body.get("message", body))
+                    # Only drop the cached JWT on actual session death. A 403 /
+                    # rate-limit / "status:false" on getCandleData used to clear
+                    # the token and re-login with password+TOTP every retry,
+                    # which turns a candle-quota problem into a login lockout.
+                    if _is_auth_error_message(msg):
+                        self._jwt_token = None
+                    raise ProviderError(f"Angel One request to {path} failed: {msg}")
                 return body
             except Exception as e:
                 last_err = e
@@ -292,19 +219,14 @@ class AngelOneProvider(MarketDataProvider):
         from_date = now - dt.timedelta(days=lookback_days)
         return self._get_candles(interval_code, from_date, now)
 
-    # ------------------- option-contract resolution & live LTP -------------------
-    # Angel-One-specific: not part of the MarketDataProvider interface, since
-    # Yahoo has no options-chain or per-strike live-quote data at all. Callers
-    # must check hasattr(provider, "resolve_option_contract") before using
-    # these — see btst_engine.run_entry_scan and watcher.py.
-
     OPTIONS_EXCHANGE = "NFO"
     UNDERLYING = "NIFTY"
+    MAX_QUOTE_TOKENS_PER_REQUEST = 50
 
     def search_option_chain(self, expiry: dt.date) -> list[dict]:
         """Every NFO option contract (both CE and PE, all strikes) for
         UNDERLYING's `expiry`. Angel One's NFO tradingsymbol format is
-        <UNDERLYING><DDMMMYY><STRIKE><CE|PE>, e.g. "NIFTY04AUG2624300CE".
+        <UNDERLYING><DDMMMYY><STRIKE><CE|PE>, e.g. \"NIFTY04AUG2624300CE\".
         """
         expiry_tag = expiry.strftime("%d%b%y").upper()  # e.g. "04AUG26"
         body = self._post(
@@ -318,8 +240,6 @@ class AngelOneProvider(MarketDataProvider):
             token = m.get("symboltoken") or m.get("symbolToken")
             if not ts or token is None:
                 continue
-            # Defense: keep only exact expiry-tag matches ending in CE/PE —
-            # a substring search can surface near-miss expiries/instruments.
             if expiry_tag not in ts or not (ts.endswith("CE") or ts.endswith("PE")):
                 continue
             contracts.append({"tradingsymbol": ts, "symbol_token": str(token)})
@@ -330,20 +250,8 @@ class AngelOneProvider(MarketDataProvider):
             )
         return contracts
 
-    # SmartAPI's quote/LTP endpoint rejects a request with too many symbols
-    # at once ("Tokens max limit exceeded") -- confirmed against a real
-    # account. NIFTY alone has 100+ strikes per expiry, easily over
-    # whatever that cap is, so this is not a hypothetical. The exact limit
-    # isn't documented anywhere we could find; 50 is a conservative chunk
-    # size. If this error resurfaces, lower MAX_QUOTE_TOKENS_PER_REQUEST.
-    MAX_QUOTE_TOKENS_PER_REQUEST = 50
-
     def get_quotes(self, tokens: list[str], exchange: str | None = None) -> dict[str, float]:
-        """Batch LTP lookup -> {symbol_token: ltp}. Transparently chunks
-        large token lists across multiple requests (see
-        MAX_QUOTE_TOKENS_PER_REQUEST) so callers never need to worry about
-        SmartAPI's per-request symbol cap.
-        """
+        """Batch LTP lookup -> {symbol_token: ltp}. Chunks large lists."""
         exchange = exchange or self.OPTIONS_EXCHANGE
         tokens = list(tokens)
         out: dict[str, float] = {}
@@ -361,66 +269,98 @@ class AngelOneProvider(MarketDataProvider):
                     out[str(token)] = float(ltp)
         return out
 
+    @staticmethod
+    def _expiry_search_dates(expiry: dt.date) -> list[dt.date]:
+        """Tuesday expiry, then previous weekdays (holiday walk-back)."""
+        out = [expiry]
+        d = expiry
+        for _ in range(4):
+            d -= dt.timedelta(days=1)
+            if d.weekday() < 5:
+                out.append(d)
+        return out
+
     def resolve_option_contract(self, side: str, expiry: dt.date, target_premium: float) -> dict:
         """Find the strike whose live premium is closest to `target_premium`
-        for `side` ("CE"/"PE") at `expiry`. Two API calls total: one search
-        across every strike, one batch quote to price all of them at once.
-        Returns {"tradingsymbol", "symbol_token", "premium"}.
+        for `side` (\"CE\"/\"PE\") at `expiry`. Walks back weekdays if that
+        Tuesday is a holiday (NSE then expires the previous session).
+        Ignores LTP <= 0 (untraded / stale prints).
+        Returns {tradingsymbol, symbol_token, premium, expiry_date}.
         """
         side = side.upper()
         if side not in ("CE", "PE"):
             raise ProviderError(f"resolve_option_contract: side must be CE or PE, got {side!r}")
 
-        contracts = [c for c in self.search_option_chain(expiry) if c["tradingsymbol"].endswith(side)]
-        if not contracts:
-            raise ProviderError(f"No {self.UNDERLYING} {side} contracts found for expiry {expiry}")
+        last_err: Exception | None = None
+        for candidate in self._expiry_search_dates(expiry):
+            try:
+                contracts = [
+                    c for c in self.search_option_chain(candidate)
+                    if c["tradingsymbol"].endswith(side)
+                ]
+            except ProviderError as e:
+                last_err = e
+                log.info("No chain for %s (%s) — trying previous session.", candidate, e)
+                continue
+            if not contracts:
+                last_err = ProviderError(
+                    f"No {self.UNDERLYING} {side} contracts found for expiry {candidate}"
+                )
+                continue
 
-        quotes = self.get_quotes([c["symbol_token"] for c in contracts])
-        priced = [(c, quotes[c["symbol_token"]]) for c in contracts if c["symbol_token"] in quotes]
-        if not priced:
-            raise ProviderError(
-                f"Angel One returned no live quotes for any {self.UNDERLYING} {side} "
-                f"contract at expiry {expiry}"
-            )
+            quotes = self.get_quotes([c["symbol_token"] for c in contracts])
+            priced = [
+                (c, quotes[c["symbol_token"]])
+                for c in contracts
+                if c["symbol_token"] in quotes and quotes[c["symbol_token"]] > 0
+            ]
+            if not priced:
+                last_err = ProviderError(
+                    f"Angel One returned no live (LTP>0) quotes for any {self.UNDERLYING} {side} "
+                    f"contract at expiry {candidate}"
+                )
+                continue
 
-        best_contract, best_ltp = min(priced, key=lambda cp: abs(cp[1] - target_premium))
-        return {
-            "tradingsymbol": best_contract["tradingsymbol"],
-            "symbol_token": best_contract["symbol_token"],
-            "premium": best_ltp,
-        }
+            best_contract, best_ltp = min(priced, key=lambda cp: abs(cp[1] - target_premium))
+            result = {
+                "tradingsymbol": best_contract["tradingsymbol"],
+                "symbol_token": best_contract["symbol_token"],
+                "premium": best_ltp,
+                "expiry_date": candidate.isoformat(),
+            }
+            if candidate != expiry:
+                log.warning("Expiry %s has no chain; using %s (holiday walk-back).",
+                            expiry, candidate)
+            return result
+
+        raise last_err or ProviderError(
+            f"Could not resolve a {side} contract near {target_premium} for expiry {expiry}"
+        )
 
     def get_index_ltp(self) -> float:
-        """Live NIFTY 50 index LTP — for reconstructing the still-forming
-        30m candle tick by tick, without repeatedly hitting getCandleData.
-        """
         quotes = self.get_quotes([self.symbol_token], exchange=self.EXCHANGE)
         if self.symbol_token not in quotes:
             raise ProviderError("Angel One quote response did not include the NIFTY index LTP")
         return quotes[self.symbol_token]
 
     def get_option_ltp(self, symbol_token: str) -> float:
-        """Live LTP for a specific held option contract, by its token."""
         quotes = self.get_quotes([symbol_token])
         if symbol_token not in quotes:
             raise ProviderError(f"Angel One quote response did not include LTP for token {symbol_token}")
         return quotes[symbol_token]
 
 
-_PROVIDERS: dict[str, type[MarketDataProvider]] = {
-    "yahoo": YahooProvider,
-    "angelone": AngelOneProvider,
-}
-
-
 def get_provider(name: str | None = None) -> MarketDataProvider:
-    """Instantiate the configured provider. Defaults to the DATA_PROVIDER
-    env var, falling back to 'yahoo' if unset.
-    """
-    key = (name or os.getenv("DATA_PROVIDER", "yahoo")).strip().lower()
-    cls = _PROVIDERS.get(key)
-    if cls is None:
+    """Instantiate Angel One. `yahoo` is rejected so a leftover env var fails loud."""
+    key = (name or os.getenv("DATA_PROVIDER", "angelone")).strip().lower()
+    if key in ("", "angelone"):
+        return AngelOneProvider()
+    if key == "yahoo":
         raise ProviderError(
-            f"Unknown DATA_PROVIDER '{key}'. Available: {sorted(_PROVIDERS)}"
+            "The Yahoo Finance provider was removed. An unofficial ~15 min delayed "
+            "feed cannot drive an 11-point NIFTY entry. Set DATA_PROVIDER=angelone "
+            "in ~/.btst.env (and restart btst-watcher)."
         )
-    return cls()
+    raise ProviderError(
+        f"Unknown DATA_PROVIDER '{key}'. Only 'angelone' is supported."
+    )

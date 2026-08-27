@@ -24,23 +24,20 @@
 #      fill these in.
 #   6. Creates deploy/run_engine.sh, a wrapper that loads ~/.btst.env and
 #      runs the engine once (this is what cron calls — daily entry decision
-#      on every provider, plus 30m exit monitoring as a Yahoo fallback).
+#      plus a 30m exit fallback if the watcher heartbeat is stale).
 #   7. Installs a crontab entry running that wrapper every 5 minutes,
 #      9:00–15:35 IST, Monday–Friday. Re-running this script is safe: it
 #      replaces its own crontab line instead of duplicating it.
 #   8. Installs and enables btst-watcher.service (systemd) — a persistent
-#      tick-level exit monitor that only does anything when DATA_PROVIDER=
-#      angelone (needs live per-tick option/index quotes Yahoo doesn't
-#      have); on any other provider it just idles. It's what actually owns
-#      exit monitoring on Angel One — the cron path steps aside for it
-#      automatically. Runs continuously, auto-restarts on crash, survives
-#      reboots.
+#      tick-level exit monitor. Cron covers 30m exits if the watcher's
+#      heartbeat goes stale. Runs continuously, auto-restarts on crash,
+#      survives reboots.
 #
 # State (open position, last scan date, last candle reported) lives in
 # ~/.btst_state.json — outside the git working tree, so pulling a later
 # code update can never conflict with or overwrite it. Both cron and the
 # watcher service read/write it, coordinated by a file lock (see
-# watcher.py's _locked_state()) so the two can never corrupt each other.
+# watcher.py / btst_engine.locked_state()) so the two can never corrupt each other.
 
 set -euo pipefail
 
@@ -106,7 +103,7 @@ if [ ! -f "$ENV_FILE" ]; then
   cat > "$ENV_FILE" <<EOF
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
-DATA_PROVIDER=yahoo
+DATA_PROVIDER=angelone
 ANGELONE_API_KEY=
 ANGELONE_CLIENT_ID=
 ANGELONE_PASSWORD=
@@ -116,6 +113,10 @@ EOF
   chmod 600 "$ENV_FILE"
 else
   echo "==> $ENV_FILE already exists — leaving it as-is"
+  if grep -q '^DATA_PROVIDER=yahoo' "$ENV_FILE" 2>/dev/null; then
+    sed -i 's/^DATA_PROVIDER=yahoo/DATA_PROVIDER=angelone/' "$ENV_FILE"
+    echo "==> Flipped DATA_PROVIDER yahoo -> angelone in $ENV_FILE (Yahoo was removed)"
+  fi
 fi
 
 mkdir -p "$APP_DIR/deploy"
@@ -151,21 +152,17 @@ cat <<EOF
 
 Done. Next steps:
   1. Edit $ENV_FILE with your real TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
-     (and ANGELONE_* if you're switching DATA_PROVIDER to angelone).
+     and ANGELONE_* (Yahoo was removed — Angel One only).
   2. Test it right now:
        $RUN_SCRIPT && tail -30 $APP_DIR/engine.log
   3. Once that Telegram message arrives, you're live — cron runs this
      automatically every 5 minutes during market hours from now on, with a
      real per-second clock instead of GitHub Actions' best-effort queue.
-  4. If you're using DATA_PROVIDER=angelone: after filling in the
-     ANGELONE_* secrets in $ENV_FILE, restart the watcher so it picks them
-     up:
+  4. After filling in ANGELONE_* secrets, restart the watcher so it picks
+     them up (EnvironmentFile is only read at service start):
        sudo systemctl restart btst-watcher
-     Check it's alive:
        sudo systemctl status btst-watcher
        tail -30 $APP_DIR/watcher.log
-     On any other provider it's safe to leave enabled -- it just idles.
-  5. Go disable the GitHub Actions schedule (see the README's "Running on
-     your own server" section) so you stop getting duplicate notifications
-     from both places.
+  5. GitHub Actions has no schedule. Keep it disabled. Use workflow_dispatch
+     only for an occasional selftest.
 EOF

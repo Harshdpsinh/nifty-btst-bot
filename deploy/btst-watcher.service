@@ -1,5 +1,5 @@
 [Unit]
-Description=NIFTY BTST tick-level exit watcher (Angel One only; idles harmlessly on other providers)
+Description=NIFTY BTST tick-level exit watcher (Angel One; cron covers exits if this heartbeat dies)
 After=network-online.target
 Wants=network-online.target
 

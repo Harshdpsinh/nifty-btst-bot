@@ -1,33 +1,21 @@
 """NIFTY 50 BTST scanner — 3:20 PM entry scan + 30m Heikin-Ashi exit monitor.
 
-Strategy logic is IDENTICAL to the original script. Every strategy parameter
-lives in the STRATEGY block below; nothing else in this file changes them.
-
-Everything outside that block is scheduling, state and delivery plumbing,
-which exists because GitHub Actions' cron is best-effort: runs are routinely
-delayed by 30-120 minutes and are sometimes dropped entirely. The engine
-therefore decides what to do from the *actual* IST clock rather than trusting
-the cron that woke it, keeps state between runs so redundant wake-ups are
-harmless, and refuses to emit a tradeable signal outside the entry window.
-
-Market data comes from a swappable provider (see providers.py) selected by
-the DATA_PROVIDER env var — switching feeds is a config change, not a code
-change. Everything below the STRATEGY block is provider-agnostic.
+Playbook: buy near the close, hold ONE night, exit on the next session's
+own 30m candles. Never two nights. Angel One SmartAPI only.
 
 Usage:
     python btst_engine.py auto        # decide from the IST clock (default)
     python btst_engine.py entry
     python btst_engine.py exit
     python btst_engine.py selftest    # verify Telegram + data plumbing
+    python btst_engine.py fill 108.50 # set actual fill so 2x partial is right
     python btst_engine.py entry --force   # ignore all clock gating
-
-Exit code is non-zero if a scan aborted or a Telegram message failed to send,
-so a silent bot shows up as a red run instead of a green one.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import logging
@@ -35,6 +23,11 @@ import os
 import pathlib
 import sys
 import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 import pandas as pd
 import pytz
@@ -52,45 +45,35 @@ ENTRY_WINDOW = "3:21 PM - 3:28 PM IST"
 TARGET_PREMIUM = "~Rs.100"
 TARGET_PREMIUM_VALUE = 100.0         # numeric form, used to pick the nearest strike
 
-# Partial profit booking (Angel One only — needs a live per-strike premium,
-# which Yahoo doesn't have): once the ACTUAL entry premium of the resolved
-# contract doubles, book this fraction of the position; the remainder still
-# exits purely on the existing 30m HA breakout rule, unchanged.
 PARTIAL_PROFIT_MULTIPLIER = 2.0
 PARTIAL_PROFIT_FRACTION = 0.5
 
-# NSE NIFTY weekly options expiry. Monday=0 ... Sunday=6. Currently Tuesday;
-# NSE has changed this weekday before (Thursday -> Monday -> Tuesday) — if it
-# moves again, this one constant is the only thing that needs to change.
 WEEKLY_EXPIRY_WEEKDAY = 1  # Tuesday
-
-# Never buy a contract inside its own expiry week's Monday/Tuesday (1-2
-# calendar days of runway left is too close: heavy theta decay, and a slow
-# move has no room to play out overnight). Roll to the following week's
-# expiry instead. Wed/Thu/Fri entries are far enough out (4-6 days) and use
-# the nearest upcoming Tuesday as normal.
 # ------------------------------------------------------------------------
 
 # --- scheduling gates (operational, not strategy) ---
 ENTRY_ACTIONABLE_FROM = dt.time(15, 18)   # earliest a signal may be acted on
 ENTRY_LATE_LIMIT = dt.time(15, 28)        # after this the window has closed
 AUTO_ENTRY_UNTIL = dt.time(20, 0)         # still report a *missed* window until here
-EXIT_MONITOR_FROM = dt.time(9, 45)        # first 30m candle close
+EXIT_MONITOR_FROM = dt.time(9, 45)        # first 30m candle close — first level can arm
+LEFTOVER_WATCH_FROM = dt.time(9, 15)      # leftover square-off can fire at the open
 EXIT_MONITOR_UNTIL = dt.time(15, 16)      # just past HARD_EXIT_TIME
 
 DAILY_LOOKBACK_DAYS = 10
 INTRADAY_LOOKBACK_DAYS = 5
 INTRADAY_INTERVAL_MIN = 30
-MAX_INTRADAY_STALENESS_MIN = 90      # data-freshness guard, not a strategy rule
+MAX_INTRADAY_STALENESS_MIN = 90
 REQUEST_TIMEOUT = 10
 TELEGRAM_MAX_CHARS = 4096
 TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_RETRY_BACKOFF_SEC = 2
+WATCHER_STALE_SECONDS = 120          # cron covers exits if heartbeat older than this
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 STATE_PATH = pathlib.Path(os.getenv("BTST_STATE_FILE", "state.json"))
+LOCK_PATH = STATE_PATH.with_suffix(".lock")
 # Send the routine 30m status update even when no position is open.
 STATUS_WHEN_FLAT = os.getenv("BTST_STATUS_WHEN_FLAT", "1") not in ("0", "false", "False")
 
@@ -118,21 +101,122 @@ def _stamp(now: dt.datetime | None = None) -> str:
     return (now or _now()).strftime("%Y-%m-%d %H:%M:%S IST")
 
 
-def _next_option_expiry(today: dt.date) -> tuple[dt.date, str]:
-    """Pick which expiry to buy today, per the risk rule above: skip the
-    current week's expiry entirely if today is its Monday or Tuesday (too
-    close), rolling to the following week instead. Returns (date, label)
-    where label is "MONTHLY" if that date happens to be the last Tuesday of
-    its calendar month (NSE doesn't list a separate weekly contract that
-    week — the weekly and monthly contract are the same instrument), else
-    "WEEKLY".
+def nse_30m_bucket_start(now: dt.datetime) -> dt.datetime:
+    """Start of the current 30m NSE bucket (session opens 9:15 → :15/:45)."""
+    minute = now.minute
+    if minute >= 45:
+        return now.replace(minute=45, second=0, microsecond=0)
+    if minute >= 15:
+        return now.replace(minute=15, second=0, microsecond=0)
+    return now.replace(minute=45, second=0, microsecond=0) - dt.timedelta(hours=1)
+
+
+def ist_minute(ts) -> pd.Timestamp:
+    """Timezone-safe minute stamp so API bars and local clocks compare equal."""
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize(IST)
+    else:
+        t = t.tz_convert(IST)
+    return t.floor("min")
+
+
+def _bar_start(idx) -> pd.Timestamp:
+    return ist_minute(idx)
+
+
+def split_closed_and_forming(day_df: pd.DataFrame, now: dt.datetime) -> tuple[pd.DataFrame, pd.Series | None]:
+    """Today's fully closed 30m bars vs the still-forming bucket (if the API returned it).
+
+    A bar is closed when its start < current NSE 30m bucket. The last row is
+    NOT blindly treated as forming — that was arming one candle late whenever
+    getCandleData omitted the in-progress bar.
     """
+    if day_df is None or day_df.empty:
+        empty = day_df if day_df is not None else pd.DataFrame()
+        return empty, None
+    bucket = ist_minute(nse_30m_bucket_start(now))
+    closed_idx = []
+    forming: pd.Series | None = None
+    for idx, row in day_df.iterrows():
+        start = ist_minute(idx)
+        if start < bucket:
+            closed_idx.append(idx)
+        elif start == bucket:
+            forming = row
+    closed = day_df.loc[closed_idx] if closed_idx else day_df.iloc[0:0]
+    return closed, forming
+
+
+def sticky_refs(closed: pd.DataFrame) -> tuple[pd.Series | None, pd.Series | None]:
+    """Most recently closed red / green of TODAY. Opposite colour does not clear."""
+    ref_red = None
+    ref_green = None
+    if closed is None or closed.empty:
+        return None, None
+    for _, row in closed.iterrows():
+        if row["Is_Red"]:
+            ref_red = row
+        elif row["Is_Green"]:
+            ref_green = row
+    return ref_red, ref_green
+
+
+def _opened_date(position: dict | None) -> dt.date | None:
+    if not position:
+        return None
+    raw = position.get("opened_date")
+    if not raw:
+        return None
+    if isinstance(raw, dt.date) and not isinstance(raw, dt.datetime):
+        return raw
+    return dt.date.fromisoformat(str(raw)[:10])
+
+
+def is_same_day_position(position: dict | None, today: dt.date) -> bool:
+    """Phase 1 just fired — hold overnight, do not use today's candles to exit."""
+    opened = _opened_date(position)
+    return opened is not None and opened == today
+
+
+def is_leftover_position(position: dict | None, today: dt.date) -> bool:
+    """Already had its one exit session and is still open — never a second night."""
+    opened = _opened_date(position)
+    if opened is None or opened >= today:
+        return False
+    exit_session = position.get("exit_session_date")
+    if not exit_session:
+        return False
+    return str(exit_session)[:10] < today.isoformat()
+
+
+def mark_exit_session(position: dict, today: dt.date) -> None:
+    if position is not None and not position.get("exit_session_date"):
+        position["exit_session_date"] = today.isoformat()
+
+
+def _next_option_expiry(today: dt.date) -> tuple[dt.date, str]:
+    """Skip current week's expiry on Mon/Tue; else nearest Tuesday. MONTHLY if last Tue of month."""
     days_ahead = (WEEKLY_EXPIRY_WEEKDAY - today.weekday()) % 7
-    candidate = today + dt.timedelta(days=days_ahead)  # this week's expiry weekday
-    if today.weekday() in (0, 1):  # Monday or Tuesday: this week's expiry is too close
+    candidate = today + dt.timedelta(days=days_ahead)
+    if today.weekday() in (0, 1):
         candidate += dt.timedelta(days=7)
     is_monthly = (candidate + dt.timedelta(days=7)).month != candidate.month
     return candidate, ("MONTHLY" if is_monthly else "WEEKLY")
+
+
+def watcher_heartbeat_fresh(state: dict, now: dt.datetime | None = None) -> bool:
+    now = now or _now()
+    raw = state.get("watcher_heartbeat")
+    if not raw:
+        return False
+    try:
+        ts = dt.datetime.fromisoformat(str(raw))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = IST.localize(ts)
+    return (now - ts).total_seconds() < WATCHER_STALE_SECONDS
 
 
 # --------------------------- notifications ---------------------------
@@ -151,7 +235,7 @@ def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.error(
             "Telegram credentials missing (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). "
-            "Console output:\n%s",
+            "Console output:\\n%s",
             message,
         )
         _send_failures += 1
@@ -163,11 +247,6 @@ def send_telegram(message: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
 
-    # Retry transient failures. Observed in production on 2026-08-20:
-    # "[Errno 101] Network is unreachable" for a single moment lost that
-    # 30-minute status update outright. Callers additionally treat a False
-    # return as "not delivered" and leave their state untouched so the
-    # message is retried later -- see the gating at every call site.
     last_err: Exception | None = None
     for attempt in range(1, TELEGRAM_SEND_RETRIES + 1):
         try:
@@ -190,7 +269,7 @@ def send_telegram(message: str) -> bool:
             if attempt < TELEGRAM_SEND_RETRIES:
                 time.sleep(TELEGRAM_RETRY_BACKOFF_SEC * attempt)
 
-    log.error("Telegram send FAILED after %d attempts: %s\nMessage was:\n%s",
+    log.error("Telegram send FAILED after %d attempts: %s\\nMessage was:\\n%s",
               TELEGRAM_SEND_RETRIES, last_err, message)
     _send_failures += 1
     return False
@@ -199,14 +278,13 @@ def send_telegram(message: str) -> bool:
 # ------------------------------ state ------------------------------
 
 _DEFAULT_STATE: dict = {
-    "entry_scan_date": None,        # ISO date the entry scan completed
-    "position": None,               # {"side","entry_spot","opened_at","opened_date",
-                                     #  "expiry_date","expiry_label", and (Angel One only)
-                                     #  "tradingsymbol","symbol_token","entry_premium",
-                                     #  "partial_booked"}
-    "last_status_candle": None,     # candle key of the last routine status sent (cron path)
+    "entry_scan_date": None,
+    "position": None,
+    "last_status_candle": None,
     "last_exit_signal_candle": None,
-    "watcher_last_status_bucket": None,  # same idea, but for watcher.py's tick-level path
+    "watcher_last_status_bucket": None,
+    "watcher_heartbeat": None,
+    "watcher_down_alert_date": None,
 }
 
 
@@ -226,19 +304,40 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    """Atomic replace so a crash cannot leave truncated JSON (which would drop the position)."""
     try:
-        STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-        log.info("State saved to %s: position=%s entry_scan_date=%s",
-                 STATE_PATH, state.get("position"), state.get("entry_scan_date"))
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+        tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
+        tmp.write_text(payload)
+        os.replace(tmp, STATE_PATH)
+        log.debug("State saved to %s: position=%s entry_scan_date=%s",
+                  STATE_PATH, state.get("position"), state.get("entry_scan_date"))
     except OSError as e:
         log.error("Could not persist state to %s: %s", STATE_PATH, e)
 
 
+@contextlib.contextmanager
+def locked_state():
+    """File-locked read-modify-write. Cron and watcher share this lock."""
+    LOCK_PATH.touch(exist_ok=True)
+    with open(LOCK_PATH, "w") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            state = load_state()
+            before = json.dumps(state, sort_keys=True)
+            yield state
+            if json.dumps(state, sort_keys=True) != before:
+                save_state(state)
+            else:
+                log.info("State unchanged.")
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 # ------------------------------ data ------------------------------
-#
-# All feed access goes through PROVIDER (see providers.py). Nothing below
-# this point knows or cares whether bars came from Yahoo, a broker API, or
-# anything else — that's the point of the abstraction.
 
 
 def _last_timestamp_ist(df: pd.DataFrame) -> pd.Timestamp:
@@ -268,17 +367,9 @@ def get_live_daily_data() -> tuple[float, float]:
 
 
 def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute HA columns for a raw OHLC frame, seeded fresh from the
-    frame's own first row. Shared by the multi-day series (diagnostics) and
-    the day-filtered view used for exit monitoring.
+    """Compute HA columns over a continuous multi-day window, seeded from the first row.
 
-    Heikin-Ashi is a RECURSIVE series: HA_Open[i] depends on HA_Open[i-1],
-    so it must always be computed over a continuous multi-day window and
-    only THEN sliced to a single day. Computing it from a day's bars in
-    isolation re-seeds HA_Open to (Open+Close)/2 of that day's first
-    candle, which silently produces different values — and different
-    CANDLE COLOURS — from every charting platform. See
-    calculate_30m_heikin_ashi_for_day.
+    Slice to a single day only AFTER this — never before. HA_Open is recursive.
     """
     ha = df.copy()
     ha["HA_Close"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4.0
@@ -296,11 +387,6 @@ def _heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def calculate_30m_heikin_ashi() -> pd.DataFrame:
-    """Build 30m Heikin-Ashi candles across the full multi-day lookback
-    window. Used for diagnostics/tests; exit monitoring itself uses
-    calculate_30m_heikin_ashi_for_day() instead. Raises on empty/stale/
-    insufficient data.
-    """
     df = PROVIDER.intraday_bars(SYMBOL, INTRADAY_INTERVAL_MIN, INTRADAY_LOOKBACK_DAYS)
     if len(df) < 2:
         raise ValueError("Need at least two 30m candles to evaluate exits.")
@@ -313,45 +399,17 @@ def calculate_30m_heikin_ashi() -> pd.DataFrame:
 
 
 def calculate_30m_heikin_ashi_for_day(day: dt.date) -> pd.DataFrame:
-    """Return ONLY `day`'s 30m Heikin-Ashi candles, computed from the full
-    continuous multi-day series and sliced afterwards.
-
-    The slicing happens AFTER the HA math, never before. Heikin-Ashi is
-    recursive (HA_Open[i] = (HA_Open[i-1] + HA_Close[i-1]) / 2), so a
-    series seeded fresh each morning diverges from what TradingView / the
-    broker chart draws — most visibly on a gap day, where the true
-    continuous HA_Open carries over from the previous session's close
-    while a fresh seed snaps to (Open+Close)/2 of the first candle. That
-    difference flips candle colours, and a flipped colour arms the wrong
-    exit level (or none at all). Confirmed in production on 2026-08-20:
-    the 09:15 candle rendered GREEN on the chart but the bot reported RED,
-    leaving a live PE position with no armed exit.
-
-    The user's rule — "only the exit day's candles count" — is about which
-    candles may be CHOSEN as the reference, and that is preserved: the
-    returned frame contains only `day`'s rows. It was never a statement
-    about how the HA arithmetic itself should be seeded.
-    """
     return calculate_30m_heikin_ashi_day_and_prev(day)[0]
 
 
 def calculate_30m_heikin_ashi_day_and_prev(day: dt.date) -> tuple[pd.DataFrame, "pd.Series | None"]:
-    """`day`'s HA rows plus the HA row immediately BEFORE them (normally the
-    previous session's closing candle, or None if the lookback window
-    doesn't reach that far).
-
-    The second value is what correctly seeds a still-forming first candle
-    of the day: HA_Open for it is (prev_HA_Open + prev_HA_Close) / 2, which
-    carries over across the overnight gap exactly as a chart draws it.
-    watcher.py needs this because at, say, 09:20 there are no closed
-    candles today yet, so there is nothing within `day` itself to seed from.
-    """
+    """`day`'s HA rows plus the HA row immediately BEFORE them."""
     df = PROVIDER.intraday_bars(SYMBOL, INTRADAY_INTERVAL_MIN, INTRADAY_LOOKBACK_DAYS)
     if len(df) < 2:
         raise ValueError("Need at least two 30m candles to evaluate exits.")
 
-    full = _heikin_ashi(df)                      # continuous, multi-day
-    day_df = full[full.index.date == day]        # sliced only AFTER the HA math
+    full = _heikin_ashi(df)
+    day_df = full[full.index.date == day]
     if day_df.empty:
         raise StaleDataError(f"No 30m candle data for {day} in the fetched window yet.")
 
@@ -360,11 +418,37 @@ def calculate_30m_heikin_ashi_day_and_prev(day: dt.date) -> tuple[pd.DataFrame, 
         raise StaleDataError(f"Latest 30m candle for {day} is {age_min:.0f} min old — feed lagging.")
 
     first_pos = full.index.get_loc(day_df.index[0])
+    if hasattr(first_pos, "start"):
+        first_pos = first_pos.start
     prev_row = full.iloc[first_pos - 1] if first_pos > 0 else None
     return day_df, prev_row
 
 
 # ---------------------------- messages ----------------------------
+
+
+def leftover_message(position: dict, now_ist: str) -> str:
+    return f"""⏰ LEFTOVER POSITION — SQUARE OFF NOW
+Time: {now_ist}
+Open position: {position.get('side')} opened {position.get('opened_at', 'unknown')}
+Contract: {position.get('tradingsymbol', position.get('side'))}
+
+This trade already had its one exit session and is still open.
+The playbook is one night — never two.
+
+⚡ ACTION REQUIRED:
+Square off ALL remaining lots immediately.
+Do not carry this position any further."""
+
+
+def cutoff_message(position: dict) -> str:
+    return f"""⏰ TIME CUTOFF REACHED ({HARD_EXIT_TIME.strftime('%I:%M %p')} IST)
+Asset: NIFTY 50
+Open position: {position['side']} opened {position.get('opened_at', 'unknown')}
+
+⚡ ACTION REQUIRED:
+Square off ALL remaining open lots immediately!
+Do not carry this position into a second night."""
 
 
 def _signal_message(side: str, now_ist: str, spot: float, ha: float, div: float,
@@ -376,13 +460,23 @@ def _signal_message(side: str, now_ist: str, spot: float, ha: float, div: float,
         "  per the no-buying-inside-expiry-week-Mon/Tue rule)"
         if expiry_rolled else ""
     )
+    holiday_note = ""
+    if contract and contract.get("expiry_date") and contract["expiry_date"] != expiry_date.isoformat():
+        actual = dt.date.fromisoformat(contract["expiry_date"])
+        holiday_note = (
+            f"\n  (listed Tuesday {expiry_date.isoformat()} had no chain — "
+            f"using {actual.strftime('%d %b %Y')} holiday walk-back)"
+        )
+        expiry_date = actual
     if contract:
         contract_line = f"Contract: {contract['tradingsymbol']}"
         premium_line = (
-            f"Entry Premium (live, Angel One): {contract['premium']:.2f}\n"
+            f"Quoted premium (live): {contract['premium']:.2f}\n"
             f"Partial profit target: {contract['premium'] * PARTIAL_PROFIT_MULTIPLIER:.2f} "
-            f"({PARTIAL_PROFIT_MULTIPLIER:.0f}x entry — books "
-            f"{PARTIAL_PROFIT_FRACTION * 100:.0f}% of the position automatically)"
+            f"({PARTIAL_PROFIT_MULTIPLIER:.0f}x quoted — books "
+            f"{PARTIAL_PROFIT_FRACTION * 100:.0f}% of the position)\n"
+            f"If your fill differs, on the VM run:\n"
+            f"  python btst_engine.py fill <your_fill_price>"
         )
     else:
         contract_line = f"Contract: Nifty {'Call' if is_call else 'Put'} Option ({side})"
@@ -402,12 +496,12 @@ Timeframe: Daily (1D) Live
 
 ⚡ ACTIONABLE STEPS
 {contract_line}
-Expiry: {expiry_date.strftime('%d %b %Y (%A)')} — {expiry_label}{expiry_note}
+Expiry: {expiry_date.strftime('%d %b %Y (%A)')} — {expiry_label}{expiry_note}{holiday_note}
 {premium_line}
 Order Type: NRML / CNC (Do not use MIS)
 Window: Execute between {ENTRY_WINDOW}
 
-🤖 Exit engine active."""
+🤖 Exit engine active. Hold overnight — do not square off today."""
 
 
 def _no_trade_message(now_ist: str, spot: float, ha: float, div: float) -> str:
@@ -437,8 +531,7 @@ def _out_of_window_message(now_ist: str, spot: float, ha: float, div: float,
         else "ℹ️ BTST PRE-WINDOW PREVIEW (not actionable)"
     )
     why = (
-        "This scan ran after the entry window closed — most likely GitHub Actions\n"
-        "delayed the scheduled run. The numbers below are informational ONLY."
+        "This scan ran after the entry window closed. The numbers below are informational ONLY."
         if late else
         "This scan ran before the entry window opened. Numbers are indicative;\n"
         "the binding scan happens inside the window."
@@ -461,17 +554,13 @@ No position has been recorded by the exit engine."""
 
 
 def _resolve_contract(side: str, expiry_date: dt.date) -> dict | None:
-    """Resolve the actual strike nearest TARGET_PREMIUM_VALUE, if the current
-    provider supports it (Angel One only — Yahoo has no options-chain data).
-    Never raises: a resolution failure shouldn't abort a valid divergence
-    signal, it just falls back to the generic "buy near ~Rs.100" message
-    with no partial-profit tracking for that position.
-    """
     if not hasattr(PROVIDER, "resolve_option_contract"):
         return None
     try:
         contract = PROVIDER.resolve_option_contract(side, expiry_date, TARGET_PREMIUM_VALUE)
-        log.info("Resolved contract: %s @ %.2f", contract["tradingsymbol"], contract["premium"])
+        log.info("Resolved contract: %s @ %.2f (expiry %s)",
+                 contract["tradingsymbol"], contract["premium"],
+                 contract.get("expiry_date", expiry_date.isoformat()))
         return contract
     except Exception as e:
         log.warning("Option contract resolution failed (%s) — falling back to generic "
@@ -496,10 +585,13 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
         live_spot, ha_close = get_live_daily_data()
     except StaleDataError as e:
         log.warning("Entry scan skipped: %s", e)
-        send_telegram(
+        delivered = send_telegram(
             f"🏖️ BTST ENTRY SCAN SKIPPED\nTime: {now_ist}\n\n{e}\n\nNo trade today."
         )
-        state["entry_scan_date"] = today
+        # Only burn the day once the window is gone. Inside 15:18–15:28 a lagging
+        # feed must retry at the next cron tick, not look like a holiday forever.
+        if now.time() > ENTRY_LATE_LIMIT and delivered:
+            state["entry_scan_date"] = today
         return
     except Exception as e:
         log.exception("Entry scan failed")
@@ -507,7 +599,7 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
             f"❌ BTST Scanner Error (entry)\nTime: {now_ist}\n{type(e).__name__}: {e}\n\n"
             f"Not marked complete — a later scheduled run will retry."
         )
-        return  # deliberately NOT marked done, so a later cron retries
+        return
 
     divergence = live_spot - ha_close
     log.info("Entry scan | spot=%.2f ha=%.2f div=%+.2f", live_spot, ha_close, divergence)
@@ -516,9 +608,11 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
     if not actionable:
         late = now.time() > ENTRY_LATE_LIMIT
         log.warning("Entry scan outside window (late=%s) — sending informational notice.", late)
-        send_telegram(_out_of_window_message(now_ist, live_spot, ha_close, divergence, late))
-        if late:
-            state["entry_scan_date"] = today  # window is gone; don't retry today
+        delivered = send_telegram(
+            _out_of_window_message(now_ist, live_spot, ha_close, divergence, late)
+        )
+        if late and delivered:
+            state["entry_scan_date"] = today
         return
 
     if divergence >= DIVERGENCE_THRESHOLD:
@@ -532,10 +626,8 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
         expiry_date, expiry_label = _next_option_expiry(now.date())
         expiry_rolled = now.weekday() in (0, 1)
         contract = _resolve_contract(side, expiry_date)
-        # Record the position ONLY if the buy signal actually reached the
-        # user. Otherwise the bot would track a trade they were never told
-        # to place -- and then send exit alerts for it tomorrow. Leaving
-        # entry_scan_date unset lets a later run inside the window retry.
+        if contract and contract.get("expiry_date"):
+            expiry_date = dt.date.fromisoformat(contract["expiry_date"])
         if not send_telegram(_signal_message(side, now_ist, live_spot, ha_close, divergence,
                                               expiry_date, expiry_label, expiry_rolled, contract)):
             log.error("BUY signal UNDELIVERED — no position recorded, will retry in-window.")
@@ -568,51 +660,54 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
     state["entry_scan_date"] = today
 
 
-def run_exit_scan(state: dict, force: bool = False) -> None:
-    """Monitor 30m Heikin-Ashi breakouts at cron cadence and send a status
-    update. This is the fallback path for providers without live per-tick
-    quotes (Yahoo) and for manual `python btst_engine.py exit` runs. On
-    Angel One, watcher.py runs this same rule tick-by-tick and is what
-    actually fires exits during market hours — run_auto() steps aside for
-    it automatically so the two never race on the same position.
+def _try_clear_position(state: dict, message: str) -> bool:
+    """Send an exit/cutoff/leftover alert. Clear position only if delivered."""
+    if not send_telegram(message):
+        log.error("Exit/cutoff alert UNDELIVERED — position kept, will retry.")
+        return False
+    state["position"] = None
+    return True
 
-    Reference rule: only the EXIT day's own 30m candles ever count (never
-    the entry day's or any earlier day's). Holding CE, the armed level is
-    the most recently CLOSED red candle's HA Low, seen so far today — it
-    updates forward every time a newer red candle closes, and a green
-    candle closing in between does not erase it. Holding PE, same thing
-    mirrored on the most recent green candle's HA High.
-    """
+
+def run_exit_scan(state: dict, force: bool = False) -> None:
+    """30m HA exit + leftover + 15:13 cutoff. Cron path and watcher-down fallback."""
     now = _now()
+    today = now.date()
     now_time = now.strftime("%H:%M IST")
     position = state.get("position")
 
-    if not force and not (EXIT_MONITOR_FROM <= now.time() < EXIT_MONITOR_UNTIL):
-        log.info("Outside 30m monitoring hours (%s) — nothing to do.", now_time)
+    # Leftover can fire from the open; HA monitoring waits for 09:45.
+    if not force:
+        if position and (is_leftover_position(position, today) or (
+                _opened_date(position) is not None
+                and _opened_date(position) < today
+                and now.time() >= HARD_EXIT_TIME)):
+            pass  # handle below even outside the 09:45–15:16 HA window
+        elif not (EXIT_MONITOR_FROM <= now.time() < EXIT_MONITOR_UNTIL):
+            log.info("Outside 30m monitoring hours (%s) — nothing to do.", now_time)
+            return
+
+    if position and is_same_day_position(position, today) and not force:
+        log.info("Position opened today — overnight hold, no same-day HA exit.")
         return
 
-    # 1. Time cutoff check — evaluated before any network call.
-    #    Only meaningful when a position is actually open, otherwise this fired
-    #    a "square off everything" alarm every single weekday.
+    if position and is_leftover_position(position, today) and not force:
+        _try_clear_position(state, leftover_message(position, _stamp(now)))
+        return
+
     if now.time() >= HARD_EXIT_TIME and not force:
         if not position:
             log.info("Past hard exit time and no open position — nothing to do.")
             return
-        send_telegram(f"""⏰ TIME CUTOFF REACHED ({HARD_EXIT_TIME.strftime('%I:%M %p')} IST)
-Asset: NIFTY 50
-Open position: {position['side']} opened {position.get('opened_at', 'unknown')}
-
-⚡ ACTION REQUIRED:
-Square off ALL remaining open lots immediately!
-Do not carry this position into a second night.""")
-        state["position"] = None
+        if is_same_day_position(position, today):
+            log.info("Past 15:13 but position is today's entry — hold overnight.")
+            return
+        _try_clear_position(state, cutoff_message(position))
         return
 
     try:
-        ha_df = calculate_30m_heikin_ashi_for_day(now.date())
+        ha_df = calculate_30m_heikin_ashi_for_day(today)
     except StaleDataError as e:
-        # Holiday, market not yet open enough for a candle, or a lagging
-        # feed: log it, don't page the user every 15 min.
         log.warning("Exit scan skipped: %s", e)
         return
     except Exception as e:
@@ -623,19 +718,17 @@ Do not carry this position into a second night.""")
         )
         return
 
-    latest = ha_df.iloc[-1]
-    candle_key = str(ha_df.index[-1])
-    closed = ha_df.iloc[:-1]  # every candle except the possibly still-forming last one
+    if position:
+        mark_exit_session(position, today)
 
-    # Sticky references: the most recent CLOSED red/green candle of TODAY
-    # only, each updating independently forward as newer ones close.
-    ref_red = None
-    ref_green = None
-    for _, row in closed.iterrows():
-        if row["Is_Red"]:
-            ref_red = row
-        elif row["Is_Green"]:
-            ref_green = row
+    closed, forming = split_closed_and_forming(ha_df, now)
+    latest = forming if forming is not None else (ha_df.iloc[-1] if not ha_df.empty else None)
+    if latest is None:
+        log.warning("No 30m bar to evaluate.")
+        return
+
+    candle_key = str(latest.name)
+    ref_red, ref_green = sticky_refs(closed)
 
     if latest["Is_Red"]:
         candle_color = "🔴 RED"
@@ -644,13 +737,11 @@ Do not carry this position into a second night.""")
     else:
         candle_color = "⚪ FLAT"
 
-    # 2. Heikin-Ashi breakout exit signals — only for the side actually held,
-    #    and only once per candle.
     already_signalled = state.get("last_exit_signal_candle") == candle_key
     if position and not already_signalled:
         side = position["side"]
         if side == "CE" and ref_red is not None and latest["HA_Low"] < ref_red["HA_Low"]:
-            send_telegram(f"""🛑 CALL (CE) EXIT SIGNAL TRIGGERED
+            msg = f"""🛑 CALL (CE) EXIT SIGNAL TRIGGERED
 Time: {now_time}
 Reason: Latest red 30m HA Low (today) broken by current HA Low
 
@@ -659,13 +750,17 @@ Reason: Latest red 30m HA Low (today) broken by current HA Low
 • Current 30m HA Low: {latest['HA_Low']:.2f} (Broken 👇)
 • Spot Close: {latest['Close']:.2f}
 
-⚡ ACTION REQUIRED: Exit ALL open Call (CE) lots!""")
-            state["last_exit_signal_candle"] = candle_key
-            state["position"] = None
-            position = None
+⚡ ACTION REQUIRED: Exit ALL open Call (CE) lots!"""
+            if send_telegram(msg):
+                state["last_exit_signal_candle"] = candle_key
+                state["position"] = None
+                position = None
+            else:
+                log.error("CE EXIT UNDELIVERED — position kept.")
+                return
 
         elif side == "PE" and ref_green is not None and latest["HA_High"] > ref_green["HA_High"]:
-            send_telegram(f"""🛑 PUT (PE) EXIT SIGNAL TRIGGERED
+            msg = f"""🛑 PUT (PE) EXIT SIGNAL TRIGGERED
 Time: {now_time}
 Reason: Latest green 30m HA High (today) broken by current HA High
 
@@ -674,13 +769,15 @@ Reason: Latest green 30m HA High (today) broken by current HA High
 • Current 30m HA High: {latest['HA_High']:.2f} (Broken 👆)
 • Spot Close: {latest['Close']:.2f}
 
-⚡ ACTION REQUIRED: Exit ALL open Put (PE) lots!""")
-            state["last_exit_signal_candle"] = candle_key
-            state["position"] = None
-            position = None
+⚡ ACTION REQUIRED: Exit ALL open Put (PE) lots!"""
+            if send_telegram(msg):
+                state["last_exit_signal_candle"] = candle_key
+                state["position"] = None
+                position = None
+            else:
+                log.error("PE EXIT UNDELIVERED — position kept.")
+                return
 
-    # 3. Routine status update — once per completed 30m candle, so the 15-minute
-    #    cron redundancy does not double-post.
     if not force and state.get("last_status_candle") == candle_key:
         log.info("Status for candle %s already sent — skipping duplicate.", candle_key)
         return
@@ -712,7 +809,7 @@ Reason: Latest green 30m HA High (today) broken by current HA High
     else:
         pos_line = "📌 OPEN POSITION: none — monitoring only"
 
-    send_telegram(f"""⏱️ 30-MIN MARKET STATUS UPDATE
+    status = f"""⏱️ 30-MIN MARKET STATUS UPDATE
 Time: {now_time}
 Asset: NIFTY 50 (Spot)
 
@@ -729,30 +826,65 @@ Asset: NIFTY 50 (Spot)
 📉 REFERENCE EXIT LEVEL(S) — today only
 {ref_block}
 
-ℹ️ System Active.""")
-    state["last_status_candle"] = candle_key
+ℹ️ System Active."""
+    if send_telegram(status):
+        state["last_status_candle"] = candle_key
+    else:
+        log.error("Status update UNDELIVERED — will retry.")
 
 
 def run_auto(state: dict) -> None:
-    """Pick the right scan from the real IST clock, not from the cron that fired."""
+    """Pick the right scan from the real IST clock. Cron covers exits if watcher is silent."""
     now = _now()
     t = now.time()
 
     if now.weekday() >= 5:
         log.info("Weekend (%s) — nothing to do.", now.strftime("%A"))
         return
-    if t < EXIT_MONITOR_FROM:
-        log.info("Before first 30m candle close (%s) — nothing to do.", t)
-        return
-    if t < EXIT_MONITOR_UNTIL:
-        if hasattr(PROVIDER, "get_index_ltp"):
-            # watcher.py owns exit monitoring exclusively on this provider —
-            # tick-level, not cron's 5-15 min cadence. Both writing to the
-            # same position from two processes would race; only one may.
-            log.info("Exit monitoring is owned by watcher.py on provider '%s' — "
-                      "nothing for cron to do here.", PROVIDER.name)
-            return
+
+    position = state.get("position")
+    leftover = bool(position) and is_leftover_position(position, now.date())
+
+    if leftover or (position and not is_same_day_position(position, now.date())
+                    and t >= HARD_EXIT_TIME):
+        log.info("Leftover / cutoff path via cron.")
         run_exit_scan(state)
+        return
+
+    if t < LEFTOVER_WATCH_FROM:
+        log.info("Before market open (%s) — nothing to do.", t)
+        return
+
+    if t < EXIT_MONITOR_UNTIL:
+        if watcher_heartbeat_fresh(state, now):
+            log.info("Watcher heartbeat fresh — cron leaves exits to watcher.py.")
+            if state.get("watcher_down_alert_date") == now.date().isoformat():
+                send_telegram(
+                    f"✅ BTST WATCHER HEARTBEAT RESTORED\nTime: {_stamp(now)}\n\n"
+                    "Tick-level exit monitoring is running again. Cron stepping aside."
+                )
+                state["watcher_down_alert_date"] = None
+            return
+        # Watcher down: cron must cover HA exits or a live position is unwatched.
+        if t >= EXIT_MONITOR_FROM or leftover:
+            today = now.date().isoformat()
+            if state.get("watcher_down_alert_date") != today:
+                send_telegram(
+                    f"""⚠️ WATCHER HEARTBEAT MISSING
+Time: {_stamp(now)}
+
+The tick-level watcher has not updated in over {WATCHER_STALE_SECONDS // 60} min.
+Cron is covering 30-minute exits until it returns.
+
+On the VM check:
+  sudo systemctl status btst-watcher
+  tail -50 ~/nifty-btst-bot/watcher.log"""
+                )
+                state["watcher_down_alert_date"] = today
+            log.warning("Watcher heartbeat stale — cron running exit scan as fallback.")
+            run_exit_scan(state)
+        else:
+            log.info("Watcher stale but first 30m candle has not closed yet.")
         return
     if t < ENTRY_ACTIONABLE_FROM:
         log.info("Between exit cutoff and entry window (%s) — nothing to do.", t)
@@ -761,6 +893,31 @@ def run_auto(state: dict) -> None:
         run_entry_scan(state)
         return
     log.info("Outside all scan windows (%s) — nothing to do.", t)
+
+
+def run_fill(state: dict, price: float) -> None:
+    """Record the actual fill so 2x partial-profit uses the playbook's real premium."""
+    position = state.get("position")
+    if not position:
+        log.error("No open position to attach a fill price to.")
+        send_telegram("⚠️ FILL ignored — no open position in state.")
+        return
+    if price <= 0:
+        log.error("Fill price must be positive, got %s", price)
+        return
+    old = position.get("entry_premium")
+    position["entry_premium"] = float(price)
+    position["fill_set_at"] = _stamp()
+    target = price * PARTIAL_PROFIT_MULTIPLIER
+    send_telegram(
+        f"""✏️ FILL PRICE UPDATED
+Contract: {position.get('tradingsymbol', position.get('side'))}
+Previous quoted premium: {old}
+Your fill: {price:.2f}
+New 2× partial target: {target:.2f}
+
+Remaining 50% still exits on the 30m HA rule."""
+    )
 
 
 def run_selftest(state: dict) -> None:
@@ -781,9 +938,6 @@ def run_selftest(state: dict) -> None:
         data_line = f"FAILED — {type(e).__name__}: {e}"
     log.info("Daily feed: %s", data_line)
 
-    # Contract resolution + live LTP are new, Angel-One-specific, and directly
-    # affect real trades (partial-profit booking, tick-level exits) — worth
-    # proving end to end before trusting them unattended.
     contract_line = "n/a (provider has no option-chain support)"
     if hasattr(PROVIDER, "resolve_option_contract"):
         try:
@@ -800,6 +954,7 @@ def run_selftest(state: dict) -> None:
             contract_line = f"FAILED — {type(e).__name__}: {e}"
     log.info("Contract resolution: %s", contract_line)
 
+    hb = state.get("watcher_heartbeat") or "never"
     send_telegram(f"""✅ BTST SELFTEST
 Time: {_stamp(now)}
 
@@ -809,6 +964,8 @@ Time: {_stamp(now)}
 • Contract resolution (CE, next valid expiry): {contract_line}
 • Open position: {state.get('position') or 'none'}
 • Last entry scan: {state.get('entry_scan_date') or 'never'}
+• Watcher heartbeat: {hb}
+• Watcher heartbeat fresh: {watcher_heartbeat_fresh(state, now)}
 
 If this arrived, credentials and chat ID are correct.""")
 
@@ -819,7 +976,13 @@ def main() -> int:
         "mode",
         nargs="?",
         default="auto",
-        choices=["auto", "entry", "exit", "all", "selftest"],
+        choices=["auto", "entry", "exit", "all", "selftest", "fill"],
+    )
+    parser.add_argument(
+        "fill_price",
+        nargs="?",
+        default=None,
+        help="actual fill premium, used with mode=fill",
     )
     parser.add_argument(
         "--force",
@@ -828,28 +991,27 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    state = load_state()
-    before = json.dumps(state, sort_keys=True)
     failed = False
-
-    try:
-        if args.mode == "auto":
-            run_auto(state)
-        elif args.mode == "selftest":
-            run_selftest(state)
-        else:
-            if args.mode in ("entry", "all"):
-                run_entry_scan(state, force=args.force)
-            if args.mode in ("exit", "all"):
-                run_exit_scan(state, force=args.force)
-    except Exception:
-        log.exception("Unhandled error in mode=%s", args.mode)
-        failed = True
-
-    if json.dumps(state, sort_keys=True) != before:
-        save_state(state)
-    else:
-        log.info("State unchanged.")
+    with locked_state() as state:
+        try:
+            if args.mode == "auto":
+                run_auto(state)
+            elif args.mode == "selftest":
+                run_selftest(state)
+            elif args.mode == "fill":
+                if args.fill_price is None:
+                    log.error("Usage: python btst_engine.py fill <price>")
+                    failed = True
+                else:
+                    run_fill(state, float(args.fill_price))
+            else:
+                if args.mode in ("entry", "all"):
+                    run_entry_scan(state, force=args.force)
+                if args.mode in ("exit", "all"):
+                    run_exit_scan(state, force=args.force)
+        except Exception:
+            log.exception("Unhandled error in mode=%s", args.mode)
+            failed = True
 
     if _send_failures:
         log.error("%d Telegram message(s) failed to send.", _send_failures)

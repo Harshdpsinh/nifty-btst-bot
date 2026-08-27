@@ -1,19 +1,9 @@
 name: Daily BTST Trading Engine
 
-# The schedule trigger is DELIBERATELY REMOVED. The bot now runs on a real
-# VM (see deploy/oracle_vm_setup.sh + README's "Running on your own server")
-# with actual per-second cron and a tick-level watcher for exits. Running
-# this workflow's schedule at the same time caused duplicate/conflicting
-# notifications and false "entry window missed" alerts in production: this
-# workflow has its own separate `state.json` (committed to the repo) that
-# never sees the VM's state, and DATA_PROVIDER here defaults to `yahoo`
-# (see the vars.DATA_PROVIDER fallback below) rather than the VM's angelone
-# config — so a scheduled run here would independently re-decide entry/exit
-# from stale state and a different data feed, racing the VM's own decision.
+# No schedule. Live trading runs on the VM (deploy/oracle_vm_setup.sh):
+# real cron + tick-level watcher. This workflow is manual selftest / debug only.
 #
-# workflow_dispatch is kept for occasional manual checks (e.g. selftest)
-# ONLY — never re-add a `schedule:` trigger here while the VM is the live
-# deployment, or this conflict comes back immediately.
+# DATA_PROVIDER is Angel One only. Yahoo was removed.
 
 on:
   workflow_dispatch:
@@ -21,7 +11,7 @@ on:
       mode:
         description: 'Which scan to run'
         type: choice
-        default: auto
+        default: selftest
         options: [auto, entry, exit, all, selftest]
       force:
         description: 'Ignore clock gating and deduplication'
@@ -29,7 +19,7 @@ on:
         default: false
 
 permissions:
-  contents: write        # required to commit state.json back to the repo
+  contents: write
 
 concurrency:
   group: btst-engine
@@ -56,23 +46,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # A single invocation: the engine picks entry vs exit from the IST clock.
-      # This replaces the old `github.event.schedule == '...'` step conditions,
-      # which silently ran BOTH scans on workflow_dispatch (the expression is
-      # null for manual runs, so `!= '50 9 * * 1-5'` was always true).
       - name: Run BTST engine
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Switch data feeds from Settings -> Secrets and variables -> Actions
-          # -> Variables (DATA_PROVIDER=yahoo|angelone) — no code push needed.
-          # See providers.py for what each provider requires.
-          DATA_PROVIDER: ${{ vars.DATA_PROVIDER || 'yahoo' }}
+          DATA_PROVIDER: angelone
           ANGELONE_API_KEY: ${{ secrets.ANGELONE_API_KEY }}
           ANGELONE_CLIENT_ID: ${{ secrets.ANGELONE_CLIENT_ID }}
           ANGELONE_PASSWORD: ${{ secrets.ANGELONE_PASSWORD }}
           ANGELONE_TOTP_SECRET: ${{ secrets.ANGELONE_TOTP_SECRET }}
-          MODE: ${{ github.event.inputs.mode || 'auto' }}
+          MODE: ${{ github.event.inputs.mode || 'selftest' }}
           FORCE: ${{ github.event.inputs.force == 'true' && '--force' || '' }}
         run: python btst_engine.py "$MODE" $FORCE
 

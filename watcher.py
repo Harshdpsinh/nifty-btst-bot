@@ -1,43 +1,13 @@
-"""Persistent tick-level exit monitor for Angel One positions.
+"""Persistent tick-level exit monitor (Angel One).
 
-Cron continues to own the daily entry decision (btst_engine.py auto/entry,
-unchanged, on every provider). Once a position is open on DATA_PROVIDER=
-angelone, THIS process exclusively owns exit monitoring for it: partial-
-profit booking and the 30m Heikin-Ashi full-exit breakout, checked on a
-tight polling loop (a few seconds) rather than cron's 5-minute cadence, so
-a break is caught within seconds, not minutes. btst_engine.py's run_auto()
-steps aside automatically whenever this provider is active (it checks for
-PROVIDER.get_index_ltp), so the two processes never both write the same
-position.
-
-Exit rule (identical to btst_engine.run_exit_scan, just checked live instead
-of once per cron invocation): the reference is the most recently CLOSED red
-(holding CE) / green (holding PE) 30m candle of TODAY only, updating forward
-each time a newer one of that colour closes. A candle of the other colour
-closing in between does not erase it.
-
-Partial profit: once the ACTUAL entry premium of the resolved option
-contract doubles (PARTIAL_PROFIT_MULTIPLIER in btst_engine.py), book
-PARTIAL_PROFIT_FRACTION of the position immediately and mark it booked.
-The remainder continues to be watched by the exact same full-exit rule,
-unchanged.
-
-Requires DATA_PROVIDER=angelone (needs live per-tick LTP for both the NIFTY
-index and the specific option contract held -- Yahoo has neither). On any
-other provider this process just idles, logging why every so often, so it's
-safe to enable the systemd service unconditionally regardless of which
-provider happens to be configured.
-
-Run continuously (see deploy/btst-watcher.service):
-    python watcher.py
-
-Not meant to be invoked ad hoc like btst_engine.py -- during market hours on
-Angel One it never returns on its own.
+Owns Day-2 exits while its heartbeat is fresh. Cron covers exits if this
+process dies. Same-day (Day-1) positions are never exited — hold overnight.
+A position that already had its one exit session and is still open is a
+leftover: square off immediately, never a second night.
 """
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import datetime as dt
 import logging
@@ -45,78 +15,49 @@ import os
 import sys
 import time
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows has no fcntl; VM deploy is Linux-only
-    fcntl = None
-
 import btst_engine as engine
 
 log = logging.getLogger("btst.watcher")
 
 POLL_SECONDS = float(os.getenv("BTST_WATCHER_POLL_SECONDS", "10"))
-IDLE_SLEEP_SECONDS = 1800          # outside market hours, weekends, unsupported provider
-CAPABILITY_LOG_EVERY = 180         # how many idle iterations between "still idle" log lines
-LOCK_PATH = engine.STATE_PATH.with_suffix(".lock")
+IDLE_SLEEP_SECONDS = 1800
+CAPABILITY_LOG_EVERY = 180
+CUTOFF_RETRY_SECONDS = 60
 
-# A few minutes past HARD_EXIT_TIME (15:13), so a watcher that's actively
-# ticking is guaranteed to observe and fire the cutoff square-off itself,
-# then go idle for the rest of the day rather than polling pointlessly
-# through the evening.
+# A few minutes past HARD_EXIT_TIME so we observe the 15:13 cutoff ourselves.
 WATCH_UNTIL = dt.time(15, 20)
+# Leftover square-off can fire at the open; HA arms at 09:45.
+WATCH_FROM = engine.LEFTOVER_WATCH_FROM
 
 
 def _capable() -> bool:
     return hasattr(engine.PROVIDER, "get_index_ltp") and hasattr(engine.PROVIDER, "get_option_ltp")
 
 
-@contextlib.contextmanager
-def _locked_state():
-    """File-locked read-modify-write of the shared state file, so this
-    long-running process and the cron-invoked entry script can never
-    corrupt each other's writes even if they land in the same instant.
-    Blocks (does not busy-wait) until the lock is free.
-    """
-    LOCK_PATH.touch(exist_ok=True)
-    with open(LOCK_PATH, "w") as lock_file:
-        if fcntl is not None:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            state = engine.load_state()
-            before = engine.json.dumps(state, sort_keys=True)
-            yield state
-            if engine.json.dumps(state, sort_keys=True) != before:
-                engine.save_state(state)
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-
 @dataclasses.dataclass
 class _CandleAccumulator:
-    """Live-updating OHLC for the still-forming 30m bucket, ticked forward
-    from index LTP polls instead of re-requesting candle history every few
-    seconds. `open` is fixed once at bucket start; high/low/close update
-    each tick. prev_ha_open/prev_ha_close come from the last authoritative
-    CLOSED candle (from calculate_30m_heikin_ashi_for_day) and seed this
-    bucket's HA_Open via the same recursive formula used everywhere else in
-    this codebase.
+    """Live OHLC for the still-forming 30m bucket. bucket_start is the NSE
+    bucket (09:45, 10:15, …), never 'whatever the API last returned'.
     """
     bucket_start: dt.datetime
-    open: float
-    high: float
-    low: float
-    close: float
+    open: float | None
+    high: float | None
+    low: float | None
+    close: float | None
     prev_ha_open: float
     prev_ha_close: float
 
     def tick(self, ltp: float) -> None:
+        if self.open is None:
+            self.open = self.high = self.low = self.close = ltp
+            return
         self.high = max(self.high, ltp)
         self.low = min(self.low, ltp)
         self.close = ltp
 
-    def live_ha(self) -> tuple[float, float, float, float]:
-        """(ha_open, ha_close, ha_high, ha_low) for this still-forming bucket."""
+    def live_ha(self) -> tuple[float, float, float, float] | None:
+        if self.open is None:
+            return None
         ha_open = (self.prev_ha_open + self.prev_ha_close) / 2.0
         ha_close = (self.open + self.high + self.low + self.close) / 4.0
         ha_high = max(self.high, ha_open, ha_close)
@@ -124,46 +65,23 @@ class _CandleAccumulator:
         return ha_open, ha_close, ha_high, ha_low
 
 
-def _bucket_start(now: dt.datetime) -> dt.datetime:
-    """Start of the current 30m bucket. NSE candles align to HH:15/HH:45
-    (the session opens at 9:15), not HH:00/HH:30 — e.g. 10:07 -> 09:45,
-    10:20 -> 10:15, 10:50 -> 10:45.
-    """
-    minute = now.minute
-    if minute >= 45:
-        return now.replace(minute=45, second=0, microsecond=0)
-    if minute >= 15:
-        return now.replace(minute=15, second=0, microsecond=0)
-    # Between HH:00 and HH:15 -- still part of the previous hour's :45 bucket.
-    return now.replace(minute=45, second=0, microsecond=0) - dt.timedelta(hours=1)
+def bootstrap(today: dt.date, now: dt.datetime) -> tuple[_CandleAccumulator, dict]:
+    """Rebuild today's HA refs from closed bars only; seed the forming bucket
+    from the API bar if present, otherwise from live LTP.
 
-
-def bootstrap(today: dt.date) -> tuple[_CandleAccumulator, dict]:
-    """(Re-)establish today's HA state from the authoritative candle
-    history — the single source of truth is always
-    calculate_30m_heikin_ashi_for_day(), never pure in-memory drift.
-    Called at the start of each market-hours session and on every detected
-    bucket rollover. Returns (accumulator for the still-forming bucket,
-    {"red": most_recent_closed_red_row_or_None, "green": ...}).
+    Does NOT treat the last history bar as forming just because it is last —
+    that delayed the 09:45 arm by a full candle and re-hit getCandleData
+    every tick when the forming bar was absent.
     """
     ha_df, prev_session_row = engine.calculate_30m_heikin_ashi_day_and_prev(today)
-    latest = ha_df.iloc[-1]
-    closed = ha_df.iloc[:-1]
+    current_bucket = engine.nse_30m_bucket_start(now)
+    closed, forming_row = engine.split_closed_and_forming(ha_df, now)
 
-    # References may ONLY be chosen from today's own closed candles.
     refs: dict = {"red": None, "green": None}
-    for _, row in closed.iterrows():
-        if row["Is_Red"]:
-            refs["red"] = row
-        elif row["Is_Green"]:
-            refs["green"] = row
+    ref_red, ref_green = engine.sticky_refs(closed)
+    refs["red"] = ref_red
+    refs["green"] = ref_green
 
-    # Seeding the forming bucket is a separate concern from reference
-    # selection, and Heikin-Ashi is recursive, so the seed must come from
-    # whatever candle actually precedes this one -- including yesterday's
-    # close when today's first candle is still forming. Seeding from
-    # (Open+Close)/2 instead silently diverges from the chart across an
-    # overnight gap and can flip the candle's colour.
     if len(closed) > 0:
         seed_open = float(closed.iloc[-1]["HA_Open"])
         seed_close = float(closed.iloc[-1]["HA_Close"])
@@ -171,16 +89,28 @@ def bootstrap(today: dt.date) -> tuple[_CandleAccumulator, dict]:
         seed_open = float(prev_session_row["HA_Open"])
         seed_close = float(prev_session_row["HA_Close"])
     else:
-        # Genuinely no prior candle in the lookback window at all.
-        seed_open = (float(latest["Open"]) + float(latest["Close"])) / 2.0
+        seed_row = forming_row if forming_row is not None else ha_df.iloc[-1]
+        seed_open = (float(seed_row["Open"]) + float(seed_row["Close"])) / 2.0
         seed_close = seed_open
 
-    acc = _CandleAccumulator(
-        bucket_start=ha_df.index[-1].to_pydatetime(),
-        open=float(latest["Open"]), high=float(latest["High"]),
-        low=float(latest["Low"]), close=float(latest["Close"]),
-        prev_ha_open=seed_open, prev_ha_close=seed_close,
-    )
+    if forming_row is not None:
+        acc = _CandleAccumulator(
+            bucket_start=current_bucket,
+            open=float(forming_row["Open"]), high=float(forming_row["High"]),
+            low=float(forming_row["Low"]), close=float(forming_row["Close"]),
+            prev_ha_open=seed_open, prev_ha_close=seed_close,
+        )
+    else:
+        ltp = None
+        try:
+            ltp = engine.PROVIDER.get_index_ltp()
+        except Exception as e:
+            log.warning("No forming bar in history and LTP seed failed: %s", e)
+        acc = _CandleAccumulator(
+            bucket_start=current_bucket,
+            open=ltp, high=ltp, low=ltp, close=ltp,
+            prev_ha_open=seed_open, prev_ha_close=seed_close,
+        )
     return acc, refs
 
 
@@ -273,8 +203,9 @@ waiting for the candle to close.
 
 
 def _handle_partial_profit(position: dict, now: dt.datetime) -> bool:
-    """Returns True if position/state should be treated as modified."""
     if position.get("partial_booked") or "symbol_token" not in position:
+        return False
+    if "entry_premium" not in position:
         return False
     try:
         ltp = engine.PROVIDER.get_option_ltp(position["symbol_token"])
@@ -283,9 +214,6 @@ def _handle_partial_profit(position: dict, now: dt.datetime) -> bool:
         return False
     target = position["entry_premium"] * engine.PARTIAL_PROFIT_MULTIPLIER
     if ltp >= target:
-        # Only mark it booked if the alert actually reached the user. On a
-        # failed send, leave the flag alone so the next tick re-fires it --
-        # marking it booked would silently swallow the instruction to sell.
         if not engine.send_telegram(_partial_profit_message(position, ltp, engine._stamp(now))):
             log.error("Partial-profit alert UNDELIVERED — will retry next tick.")
             return False
@@ -297,15 +225,13 @@ def _handle_partial_profit(position: dict, now: dt.datetime) -> bool:
 
 def _handle_full_exit(state: dict, position: dict, acc: _CandleAccumulator, refs: dict,
                        now: dt.datetime) -> bool:
-    """Returns True if the position was closed (state modified)."""
-    ha_open, ha_close, ha_high, ha_low = acc.live_ha()
+    live = acc.live_ha()
+    if live is None:
+        return False
+    ha_open, ha_close, ha_high, ha_low = live
     side = position["side"]
     now_time = engine._stamp(now)
 
-    # Clearing the position on an UNDELIVERED exit alert is the worst failure
-    # this bot can have: the user keeps holding a live trade while the bot
-    # believes it is flat, and never sends the signal again. Always gate the
-    # clear on delivery; an undelivered alert simply re-fires next tick.
     if side == "CE" and refs["red"] is not None and ha_low < refs["red"]["HA_Low"]:
         if not engine.send_telegram(_full_exit_message(
                 position, "CE", now_time, refs["red"], "HA_Low", ha_low, "👇")):
@@ -330,36 +256,29 @@ def _handle_full_exit(state: dict, position: dict, acc: _CandleAccumulator, refs
 def _hard_cutoff(state: dict, position: dict, now: dt.datetime) -> bool:
     if now.time() < engine.HARD_EXIT_TIME:
         return False
-    if not engine.send_telegram(f"""⏰ TIME CUTOFF REACHED ({engine.HARD_EXIT_TIME.strftime('%I:%M %p')} IST)
-Asset: NIFTY 50
-Open position: {position['side']} opened {position.get('opened_at', 'unknown')}
-
-⚡ ACTION REQUIRED:
-Square off ALL remaining open lots immediately!
-Do not carry this position into a second night."""):
-        # Undelivered: keep the position so the next tick re-sends. Returning
-        # True still short-circuits the rest of the tick, which is correct --
-        # past the cutoff there is nothing else to do but get this message out.
-        log.error("TIME CUTOFF alert UNDELIVERED — position kept, retrying next tick.")
+    if engine.is_same_day_position(position, now.date()):
+        return False
+    if not engine.send_telegram(engine.cutoff_message(position)):
+        log.error("TIME CUTOFF alert UNDELIVERED — position kept, retrying.")
         return True
     state["position"] = None
     log.info("Hard cutoff square-off fired.")
     return True
 
 
-# A stuck watcher that fails silently for days is exactly what happened in
-# production (a stale Angel One session token, retried forever with no
-# alert). These two thresholds turn sustained failures into a Telegram
-# alert instead of a silent log line nobody's watching.
-ALERT_AFTER_FAILURES = 3          # consecutive failures before the first alert
-ALERT_COOLDOWN_SECONDS = 1800     # don't re-alert more often than this while still stuck
+def _leftover_exit(state: dict, position: dict, now: dt.datetime) -> bool:
+    if not engine.is_leftover_position(position, now.date()):
+        return False
+    if not engine.send_telegram(engine.leftover_message(position, engine._stamp(now))):
+        log.error("LEFTOVER alert UNDELIVERED — position kept, retrying.")
+        return True
+    state["position"] = None
+    log.info("Leftover square-off fired.")
+    return True
 
-# Escalating wait before RETRYING a failed bootstrap. Without this, a failed
-# bootstrap is retried every POLL_SECONDS, and each retry burns RETRIES HTTP
-# calls -- roughly 675 getCandleData calls/hour. Angel One rate-limits that
-# endpoint, so the storm sustains the very 403 it is reacting to: observed in
-# production on 2026-08-20, where transient 403s escalated into a permanent
-# one and every status update stopped for the rest of the session.
+
+ALERT_AFTER_FAILURES = 3
+ALERT_COOLDOWN_SECONDS = 1800
 BOOTSTRAP_BACKOFF_SECONDS = (30, 60, 120, 300, 600)
 
 
@@ -384,7 +303,9 @@ The tick-level watcher has failed {health.consecutive_failures} times in a row:
 
 It keeps retrying automatically, and this alert repeats every \
 {ALERT_COOLDOWN_SECONDS // 60} min while it stays broken — but exit \
-monitoring is NOT running right now. Check watcher.log on the VM.""")
+monitoring is NOT running right now. Check watcher.log on the VM.
+
+Cron will cover 30-minute exits while the heartbeat is stale.""")
     health.last_alert = now
 
 
@@ -400,36 +321,43 @@ failed attempts.""")
     health.next_bootstrap_at = None
 
 
-def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
-                   health: _HealthTracker) -> tuple[_CandleAccumulator, dict]:
-    """last_status_bucket is deliberately NOT passed as an in-memory
-    parameter — it's read from and written to state["watcher_last_status_bucket"]
-    instead, so a crash-loop within the same candle can't resend duplicate
-    status messages (the in-memory equivalent would reset to None on every
-    restart; the persisted one survives it).
-    """
-    now = engine._now()
+def _touch_heartbeat(state: dict, now: dt.datetime) -> None:
+    state["watcher_heartbeat"] = now.isoformat()
 
-    with _locked_state() as state:
+
+def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
+                   health: _HealthTracker) -> tuple[_CandleAccumulator | None, dict | None]:
+    now = engine._now()
+    today = now.date()
+
+    with engine.locked_state() as state:
+        _touch_heartbeat(state, now)
         position = state.get("position")
+
+        if position and _leftover_exit(state, position, now):
+            return acc, refs
+
+        if position and engine.is_same_day_position(position, today):
+            log.info("Same-day position — overnight hold, watcher not exiting.")
+            return acc, refs
 
         if position and _hard_cutoff(state, position, now):
             return acc, refs
 
-        current_bucket = _bucket_start(now)
-        rolled_over = acc is None or current_bucket != acc.bucket_start
+        if now.time() < engine.EXIT_MONITOR_FROM:
+            return acc, refs
+
+        current_bucket = engine.nse_30m_bucket_start(now)
+        rolled_over = (
+            acc is None
+            or engine.ist_minute(current_bucket) != engine.ist_minute(acc.bucket_start)
+        )
         if rolled_over:
-            # Respect the post-failure backoff. Retrying a failed bootstrap
-            # every tick hammers a rate-limited endpoint and keeps it failing.
             if health.next_bootstrap_at is not None and now < health.next_bootstrap_at:
                 return acc, refs
             try:
-                acc, refs = bootstrap(now.date())
+                acc, refs = bootstrap(today, now)
             except engine.StaleDataError as e:
-                # Holiday / market not open long enough yet for a candle —
-                # expected and quiet, doesn't count as a failure. Still back
-                # off: re-asking every 10s for a candle that cannot exist yet
-                # burns the same rate limit as a hard failure does.
                 log.warning("Bootstrap skipped (backing off): %s", e)
                 health.next_bootstrap_at = now + dt.timedelta(
                     seconds=BOOTSTRAP_BACKOFF_SECONDS[0])
@@ -443,20 +371,26 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
                 return acc, refs
             _record_success(health, now)
 
+            if position:
+                engine.mark_exit_session(position, today)
+
             bucket_key = acc.bucket_start.isoformat()
-            if state.get("watcher_last_status_bucket") != bucket_key and (position or engine.STATUS_WHEN_FLAT):
-                ha_open, ha_close, ha_high, ha_low = acc.live_ha()
-                # Advance the dedup key ONLY on a delivered message. Marking
-                # the bucket as sent after a failed send is what silently
-                # dropped the 14:45 status on 2026-08-20.
+            live = acc.live_ha()
+            if (live is not None
+                    and state.get("watcher_last_status_bucket") != bucket_key
+                    and (position or engine.STATUS_WHEN_FLAT)):
+                ha_open, ha_close, ha_high, ha_low = live
                 if engine.send_telegram(_status_message(
                         now.strftime("%H:%M IST"), position, ha_open, ha_close, ha_high, ha_low,
-                        acc.close, refs)):
+                        acc.close if acc.close is not None else 0.0, refs)):
                     state["watcher_last_status_bucket"] = bucket_key
                 else:
                     log.error("Status update UNDELIVERED — will retry next tick.")
 
         if not position:
+            return acc, refs
+
+        if acc is None:
             return acc, refs
 
         try:
@@ -474,6 +408,19 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
     return acc, refs
 
 
+def _should_stay_awake(now: dt.datetime, state: dict) -> bool:
+    """Market hours, or an open position that still needs cutoff/leftover retries."""
+    if now.weekday() >= 5:
+        return False
+    position = state.get("position")
+    if position and not engine.is_same_day_position(position, now.date()):
+        if engine.is_leftover_position(position, now.date()):
+            return True
+        if now.time() >= engine.HARD_EXIT_TIME:
+            return True
+    return WATCH_FROM <= now.time() < WATCH_UNTIL
+
+
 def main() -> int:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -488,18 +435,26 @@ def main() -> int:
 
     while True:
         now = engine._now()
-        in_window = (
-            now.weekday() < 5
-            and engine.EXIT_MONITOR_FROM <= now.time() < WATCH_UNTIL
-        )
-        if not (_capable() and in_window):
-            acc = None  # force a fresh bootstrap whenever we re-enter the window
-            health = _HealthTracker()  # a stale failure streak shouldn't carry into tomorrow
+        with engine.locked_state() as peek:
+            stay = _should_stay_awake(now, peek)
+            # Heartbeat even while deciding, so cron knows we're alive during hours.
+            if stay:
+                peek["watcher_heartbeat"] = now.isoformat()
+
+        if not (_capable() and stay):
+            acc = None
+            health = _HealthTracker()
+            nxt = now.replace(hour=9, minute=15, second=0, microsecond=0)
+            if now >= nxt:
+                nxt += dt.timedelta(days=1)
+            while nxt.weekday() >= 5:
+                nxt += dt.timedelta(days=1)
+            sleep_for = min(IDLE_SLEEP_SECONDS, max(10.0, (nxt - now).total_seconds()))
             if idle_iterations % CAPABILITY_LOG_EVERY == 0:
                 reason = "provider has no live LTP support" if not _capable() else "outside market hours"
-                log.info("Idle (%s) — sleeping %ds.", reason, IDLE_SLEEP_SECONDS)
+                log.info("Idle (%s) — sleeping %.0fs.", reason, sleep_for)
             idle_iterations += 1
-            time.sleep(IDLE_SLEEP_SECONDS)
+            time.sleep(sleep_for)
             continue
 
         idle_iterations = 0
@@ -508,7 +463,13 @@ def main() -> int:
         except Exception as e:
             log.exception("Unhandled error in watcher tick — continuing.")
             _record_failure(health, f"Tick loop: {type(e).__name__}: {e}", now)
-        time.sleep(POLL_SECONDS)
+
+        # After 15:13 with an undelivered cutoff, don't hammer every 10s all evening.
+        if now.time() >= engine.HARD_EXIT_TIME:
+            sleep_for = CUTOFF_RETRY_SECONDS
+        else:
+            sleep_for = POLL_SECONDS
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":

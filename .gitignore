@@ -6,3 +6,4 @@ venv/
 engine.log
 watcher.log
 state.lock
+*.tmp
