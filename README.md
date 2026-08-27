@@ -24,29 +24,28 @@ holiday, the chain lookup walks back to the previous weekday.
 State lives in `~/.btst_state.json` — **outside** the repo — so a pull cannot
 wipe an open position.
 
+**This chat cannot SSH your VM.** Open Oracle Cloud Shell / PuTTY / your
+terminal, SSH in, then paste **one** line:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Harshdpsinh/nifty-btst-bot/main/deploy/update_from_main.sh | bash
+```
+
+That pulls `main`, forces `DATA_PROVIDER=angelone`, installs deps, restarts
+`btst-watcher`, and runs `selftest`. It never deletes `~/.btst_state.json`.
+
+Manual equivalent:
+
 ```bash
 ssh your-vm
 cd ~/nifty-btst-bot
 git pull --ff-only
-# Yahoo is gone. If this still says yahoo, the process will refuse to start:
-grep DATA_PROVIDER ~/.btst.env
-nano ~/.btst.env          # must be DATA_PROVIDER=angelone and all ANGELONE_* filled
-# Recreate venv so yfinance is gone
+grep DATA_PROVIDER ~/.btst.env    # must be angelone
 .venv/bin/pip install -r requirements.txt
 sudo systemctl restart btst-watcher
 sudo systemctl status btst-watcher
-tail -30 watcher.log
-~/nifty-btst-bot/deploy/run_engine.sh
-tail -30 engine.log
-```
-
-You should get a Telegram selftest-like log line, or a 30m status if the market
-is open. Then:
-
-```bash
 ~/nifty-btst-bot/.venv/bin/python ~/nifty-btst-bot/btst_engine.py selftest
 ```
-
 If you bought today and your fill ≠ the quoted premium in the 🚨 message:
 
 ```bash
