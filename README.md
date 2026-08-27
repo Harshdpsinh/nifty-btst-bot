@@ -76,6 +76,24 @@ Offline checks: `python test_playbook_guards.py` (22 tests). They also run in
 GitHub Actions on every push (`.github/workflows/tests.yml`) — green there means
 the guards still hold before you pull to the VM.
 
+## Locked out of the VM?
+
+If `ssh -v -i ~/.ssh/YOUR_KEY ubuntu@VM_IP` shows your key **offered and then
+refused** — `Offering public key: ...` followed by `Authentications that can
+continue: publickey` — the public key was never installed on that instance.
+Trying other usernames will not help, and OCI cannot inject a key into a
+running instance. Launch a replacement carrying a key you hold, from **Oracle
+Cloud Shell**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Harshdpsinh/nifty-btst-bot/main/deploy/relaunch_vm.sh | bash -s -- OLD_VM_NAME
+```
+
+It copies the old VM's compartment, availability domain, shape and subnet (so
+the security rule that opens port 22 carries over), installs
+`~/.ssh/btst_key.pub`, and leaves the old VM running. Then SSH to the new IP it
+prints and run `oracle_vm_setup.sh` there.
+
 ## Setup (new VM)
 
 ```bash
