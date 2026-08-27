@@ -41,6 +41,68 @@
 
 set -euo pipefail
 
+# --- Wrong-host guard -------------------------------------------------------
+# This bot needs systemd + cron on a machine that stays up. Oracle Cloud Shell
+# is an ephemeral browser container: no systemd, and everything is destroyed
+# when the tab closes. Detect it BEFORE doing any work.
+_is_cloud_shell() {
+  case "$(hostname 2>/dev/null | tr '[:upper:]' '[:lower:]')" in
+    *cloudshell*|*cloud-shell*) return 0 ;;
+  esac
+  [ -n "${OCI_CLOUD_SHELL:-}" ] && return 0
+  [ -n "${CLOUD_SHELL_TOOL_CONFIG:-}" ] && return 0
+  [ -n "${OCI_CS_HOME:-}" ] && return 0
+  [ -d /etc/oci-cloud-shell ] && return 0
+  return 1
+}
+
+# Canonical "systemd is PID 1 and running" test.
+_has_systemd() { [ -d /run/systemd/system ]; }
+
+_wrong_host_banner() {
+  echo
+  echo "================================================================"
+  echo " WRONG MACHINE — this host cannot run the BTST bot."
+  echo "================================================================"
+  if _is_cloud_shell; then
+    echo
+    echo "You are in Oracle Cloud Shell (the browser terminal). It is"
+    echo "ephemeral: no systemd, and the container is wiped when the tab"
+    echo "closes. The watcher would stop the moment you walk away."
+  else
+    echo
+    echo "This host has no running systemd (/run/systemd/system missing),"
+    echo "so btst-watcher.service cannot be installed or kept alive."
+  fi
+  echo
+  echo "Do this instead, from THIS Cloud Shell:"
+  echo
+  echo "  1. Find your Always Free Compute VM's public IP:"
+  echo "       oci compute instance list --compartment-id \\"
+  echo "         \"\$(oci iam compartment list --all --query 'data[0].id' --raw-output)\" \\"
+  echo "         --query 'data[*].{name:\"display-name\",state:\"lifecycle-state\"}' --output table"
+  echo
+  echo "  2. SSH in with the key you actually have (check: ls ~/.ssh):"
+  echo "       chmod 600 ~/.ssh/YOUR_KEY"
+  echo "       ssh -i ~/.ssh/YOUR_KEY ubuntu@YOUR_VM_IP     # Ubuntu images"
+  echo "       ssh -i ~/.ssh/YOUR_KEY opc@YOUR_VM_IP        # Oracle Linux images"
+  echo
+  echo "     The prompt must change away from 'cloudshell' before step 3."
+  echo
+  echo "  3. Re-run this same curl | bash line INSIDE that SSH session."
+  echo
+  echo "If you have no Compute instance yet, create an Always Free VM first."
+  echo "Do NOT install the bot in Cloud Shell."
+  echo
+}
+
+if _is_cloud_shell || ! _has_systemd; then
+  _wrong_host_banner
+  exit 1
+fi
+# ---------------------------------------------------------------------------
+
+
 REPO_URL="https://github.com/Harshdpsinh/nifty-btst-bot.git"
 APP_DIR="$HOME/nifty-btst-bot"
 ENV_FILE="$HOME/.btst.env"
