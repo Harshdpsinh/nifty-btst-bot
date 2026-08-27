@@ -19,7 +19,25 @@ else
 fi
 
 if [ ! -d "${APP_DIR}/.git" ]; then
-  echo "ERROR: ${APP_DIR} is not a git clone. Run deploy/oracle_vm_setup.sh once first."
+  echo
+  echo "ERROR: ${APP_DIR} is not a git clone."
+  echo
+  if [ "$(hostname -s 2>/dev/null)" = "cloudshell" ] || [ -n "${OCI_CLOUD_SHELL:-}" ] || [ -n "${CLOUD_SHELL_TOOL_CONFIG:-}" ]; then
+    echo "You are in Oracle Cloud Shell (browser terminal). That machine is"
+    echo "ephemeral and CANNOT run this bot (systemd/cron die when the tab closes)."
+    echo
+    echo "Do this instead:"
+    echo "  1. Keep this Cloud Shell open."
+    echo "  2. Paste the 'list instances' command from the README / chat."
+    echo "  3. SSH into your Always Free Compute VM (ubuntu@IP or opc@IP)."
+    echo "  4. Run this curl|bash line AGAIN inside that SSH session."
+    echo
+    echo "If you have no Compute instance yet, create an Always Free VM first"
+    echo "(do NOT install the bot in Cloud Shell)."
+  else
+    echo "This host has no bot install. First-time setup on a persistent VM:"
+    echo "  curl -fsSL https://raw.githubusercontent.com/Harshdpsinh/nifty-btst-bot/main/deploy/oracle_vm_setup.sh | bash"
+  fi
   exit 1
 fi
 
