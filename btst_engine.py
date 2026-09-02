@@ -34,6 +34,7 @@ import pytz
 import requests
 
 from providers import get_provider
+import execution
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -91,6 +92,11 @@ _send_failures = 0
 
 class StaleDataError(RuntimeError):
     """Raised when the feed returns data too old to act on."""
+
+
+def daily_divergence(spot: float, open_p: float, high_p: float, low_p: float) -> float:
+    """Playbook: spot − (O+H+L+spot)/4."""
+    return float(spot) - (float(open_p) + float(high_p) + float(low_p) + float(spot)) / 4.0
 
 
 def _now() -> dt.datetime:
@@ -362,7 +368,7 @@ def get_live_daily_data() -> tuple[float, float]:
     high_price = float(df["High"].iloc[-1])
     low_price = float(df["Low"].iloc[-1])
 
-    ha_live_close = (open_price + high_price + low_price + live_spot) / 4.0
+    ha_live_close = live_spot - daily_divergence(live_spot, open_price, high_price, low_price)
     return live_spot, ha_live_close
 
 
@@ -628,8 +634,10 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
         contract = _resolve_contract(side, expiry_date)
         if contract and contract.get("expiry_date"):
             expiry_date = dt.date.fromisoformat(contract["expiry_date"])
-        if not send_telegram(_signal_message(side, now_ist, live_spot, ha_close, divergence,
-                                              expiry_date, expiry_label, expiry_rolled, contract)):
+        intent = execution.make_buy_intent(side, today, contract)
+        msg = _signal_message(side, now_ist, live_spot, ha_close, divergence,
+                              expiry_date, expiry_label, expiry_rolled, contract)
+        if not execution.submit(state, intent, send_telegram, msg):
             log.error("BUY signal UNDELIVERED — no position recorded, will retry in-window.")
             return
         state["position"] = {
@@ -639,6 +647,9 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
             "opened_date": today,
             "expiry_date": expiry_date.isoformat(),
             "expiry_label": expiry_label,
+            "lots": execution.configured_lots(),
+            "lots_remaining": execution.configured_lots(),
+            "lot_size": execution.lot_size(),
         }
         if contract:
             state["position"].update({
@@ -660,9 +671,13 @@ def run_entry_scan(state: dict, force: bool = False) -> None:
     state["entry_scan_date"] = today
 
 
-def _try_clear_position(state: dict, message: str) -> bool:
-    """Send an exit/cutoff/leftover alert. Clear position only if delivered."""
-    if not send_telegram(message):
+def _try_clear_position(state: dict, message: str, intent: "execution.OrderIntent | None" = None) -> bool:
+    """Send an exit/cutoff/leftover alert (plus dry-run intent). Clear only if delivered."""
+    if intent is not None:
+        ok = execution.submit(state, intent, send_telegram, message)
+    else:
+        ok = send_telegram(message)
+    if not ok:
         log.error("Exit/cutoff alert UNDELIVERED — position kept, will retry.")
         return False
     state["position"] = None
@@ -692,7 +707,10 @@ def run_exit_scan(state: dict, force: bool = False) -> None:
         return
 
     if position and is_leftover_position(position, today) and not force:
-        _try_clear_position(state, leftover_message(position, _stamp(now)))
+        intent = execution.make_sell_intent(
+            position, reason="leftover", day=today.isoformat()
+        )
+        _try_clear_position(state, leftover_message(position, _stamp(now)), intent)
         return
 
     # Stamp the exit session the moment we know today is it — BEFORE the feed
@@ -710,7 +728,10 @@ def run_exit_scan(state: dict, force: bool = False) -> None:
         if is_same_day_position(position, today):
             log.info("Past 15:13 but position is today's entry — hold overnight.")
             return
-        _try_clear_position(state, cutoff_message(position))
+        intent = execution.make_sell_intent(
+            position, reason="cutoff_1513", day=today.isoformat()
+        )
+        _try_clear_position(state, cutoff_message(position), intent)
         return
 
     try:
@@ -756,7 +777,10 @@ Reason: Latest red 30m HA Low (today) broken by current HA Low
 • Spot Close: {latest['Close']:.2f}
 
 ⚡ ACTION REQUIRED: Exit ALL open Call (CE) lots!"""
-            if send_telegram(msg):
+            intent = execution.make_sell_intent(
+                position, reason="ha_exit", day=today.isoformat()
+            )
+            if execution.submit(state, intent, send_telegram, msg):
                 state["last_exit_signal_candle"] = candle_key
                 state["position"] = None
                 position = None
@@ -775,7 +799,10 @@ Reason: Latest green 30m HA High (today) broken by current HA High
 • Spot Close: {latest['Close']:.2f}
 
 ⚡ ACTION REQUIRED: Exit ALL open Put (PE) lots!"""
-            if send_telegram(msg):
+            intent = execution.make_sell_intent(
+                position, reason="ha_exit", day=today.isoformat()
+            )
+            if execution.submit(state, intent, send_telegram, msg):
                 state["last_exit_signal_candle"] = candle_key
                 state["position"] = None
                 position = None
@@ -976,8 +1003,10 @@ Time: {_stamp(now)}
 • Telegram delivery: working (you are reading this)
 • Daily feed: {data_line}
 • Contract resolution (CE, next valid expiry): {contract_line}
+{execution.status_lines()}
 • Open position: {state.get('position') or 'none'}
 • Last entry scan: {state.get('entry_scan_date') or 'never'}
+• Dry-run actions recorded: {len(state.get('submitted_actions') or [])}
 • Watcher heartbeat: {hb}
 • Watcher heartbeat fresh: {watcher_heartbeat_fresh(state, now)}
 

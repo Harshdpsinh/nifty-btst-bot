@@ -36,10 +36,12 @@ jobs:
           pip install -r requirements.txt
 
       - name: Byte-compile
-        run: python -m compileall -q btst_engine.py providers.py watcher.py
+        run: python -m compileall -q btst_engine.py providers.py watcher.py execution.py backtest_btst.py
 
       - name: Playbook guard tests
         # No secrets: the suite is offline by construction (no Telegram creds,
         # every provider call mocked). If a test ever needs the network, it is
         # the wrong test.
-        run: python test_playbook_guards.py
+        run: |
+          python test_playbook_guards.py
+          python test_phase12.py

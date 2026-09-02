@@ -16,6 +16,7 @@ import sys
 import time
 
 import btst_engine as engine
+import execution
 
 log = logging.getLogger("btst.watcher")
 
@@ -202,7 +203,7 @@ waiting for the candle to close.
 ⚡ ACTION REQUIRED: Exit ALL remaining open {label} lots!"""
 
 
-def _handle_partial_profit(position: dict, now: dt.datetime) -> bool:
+def _handle_partial_profit(state: dict, position: dict, now: dt.datetime) -> bool:
     if position.get("partial_booked") or "symbol_token" not in position:
         return False
     if "entry_premium" not in position:
@@ -214,11 +215,19 @@ def _handle_partial_profit(position: dict, now: dt.datetime) -> bool:
         return False
     target = position["entry_premium"] * engine.PARTIAL_PROFIT_MULTIPLIER
     if ltp >= target:
-        if not engine.send_telegram(_partial_profit_message(position, ltp, engine._stamp(now))):
+        intent = execution.make_partial_intent(position, ltp, now.date().isoformat())
+        msg = _partial_profit_message(position, ltp, engine._stamp(now))
+        if intent.skip_reason:
+            msg += f"\n\n⚠️ {intent.skip_reason}"
+        if not execution.submit(state, intent, engine.send_telegram, msg):
             log.error("Partial-profit alert UNDELIVERED — will retry next tick.")
             return False
         position["partial_booked"] = True
-        log.info("Partial profit booked: %s ltp=%.2f target=%.2f", position["side"], ltp, target)
+        if intent.transaction == "SELL":
+            remaining = int(position.get("lots_remaining") or execution.configured_lots(position))
+            position["lots_remaining"] = max(0, remaining - intent.lots)
+        log.info("Partial profit handled: %s ltp=%.2f target=%.2f lots_sold=%s skip=%s",
+                 position["side"], ltp, target, intent.lots, intent.skip_reason or "no")
         return True
     return False
 
@@ -233,7 +242,10 @@ def _handle_full_exit(state: dict, position: dict, acc: _CandleAccumulator, refs
     now_time = engine._stamp(now)
 
     if side == "CE" and refs["red"] is not None and ha_low < refs["red"]["HA_Low"]:
-        if not engine.send_telegram(_full_exit_message(
+        intent = execution.make_sell_intent(
+            position, reason="ha_exit", day=now.date().isoformat()
+        )
+        if not execution.submit(state, intent, engine.send_telegram, _full_exit_message(
                 position, "CE", now_time, refs["red"], "HA_Low", ha_low, "👇")):
             log.error("CE EXIT alert UNDELIVERED — position kept open, retrying next tick.")
             return False
@@ -242,7 +254,10 @@ def _handle_full_exit(state: dict, position: dict, acc: _CandleAccumulator, refs
         return True
 
     if side == "PE" and refs["green"] is not None and ha_high > refs["green"]["HA_High"]:
-        if not engine.send_telegram(_full_exit_message(
+        intent = execution.make_sell_intent(
+            position, reason="ha_exit", day=now.date().isoformat()
+        )
+        if not execution.submit(state, intent, engine.send_telegram, _full_exit_message(
                 position, "PE", now_time, refs["green"], "HA_High", ha_high, "👆")):
             log.error("PE EXIT alert UNDELIVERED — position kept open, retrying next tick.")
             return False
@@ -258,7 +273,10 @@ def _hard_cutoff(state: dict, position: dict, now: dt.datetime) -> bool:
         return False
     if engine.is_same_day_position(position, now.date()):
         return False
-    if not engine.send_telegram(engine.cutoff_message(position)):
+    intent = execution.make_sell_intent(
+        position, reason="cutoff_1513", day=now.date().isoformat()
+    )
+    if not execution.submit(state, intent, engine.send_telegram, engine.cutoff_message(position)):
         log.error("TIME CUTOFF alert UNDELIVERED — position kept, retrying.")
         return True
     state["position"] = None
@@ -269,7 +287,11 @@ def _hard_cutoff(state: dict, position: dict, now: dt.datetime) -> bool:
 def _leftover_exit(state: dict, position: dict, now: dt.datetime) -> bool:
     if not engine.is_leftover_position(position, now.date()):
         return False
-    if not engine.send_telegram(engine.leftover_message(position, engine._stamp(now))):
+    intent = execution.make_sell_intent(
+        position, reason="leftover", day=now.date().isoformat()
+    )
+    if not execution.submit(state, intent, engine.send_telegram,
+                            engine.leftover_message(position, engine._stamp(now))):
         log.error("LEFTOVER alert UNDELIVERED — position kept, retrying.")
         return True
     state["position"] = None
@@ -406,7 +428,7 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
         _record_success(health, now)
         acc.tick(ltp)
 
-        _handle_partial_profit(position, now)
+        _handle_partial_profit(state, position, now)
         _handle_full_exit(state, position, acc, refs, now)
 
     return acc, refs

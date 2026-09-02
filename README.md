@@ -72,9 +72,8 @@ path. `workflow_dispatch` / `selftest` is optional.
 11. **A Telegram blip no longer silences the "watcher is down" warning** for the
     rest of the day — the once-a-day flag is only burned if the alert landed.
 
-Offline checks: `python test_playbook_guards.py` (22 tests). They also run in
-GitHub Actions on every push (`.github/workflows/tests.yml`) — green there means
-the guards still hold before you pull to the VM.
+Offline checks: `python test_playbook_guards.py` and `python test_phase12.py`.
+They also run in GitHub Actions on every push (`.github/workflows/tests.yml`).
 
 ## Locked out of the VM?
 
@@ -119,13 +118,43 @@ python btst_engine.py exit
 python btst_engine.py selftest
 python btst_engine.py fill 108.50  # actual fill for 2× partial
 python btst_engine.py exit --force
+python backtest_btst.py            # Phase 1 fixture (no network)
 ```
 
 Non-zero exit if a scan aborted or Telegram failed.
 
+Offline checks: `python test_playbook_guards.py && python test_phase12.py`
+
+## Phase 1 — backtest (index-point proxy)
+
+```bash
+python backtest_btst.py
+python backtest_btst.py --csv-daily daily.csv --csv-30m m30.csv
+python backtest_btst.py --live --lookback-days 20   # Angel One, short window
+```
+
+This is **not** option P&L. It scores the playbook in NIFTY points using daily close as a stand-in for 15:21 and closed 30m HA High/Low as a stand-in for mid-candle breaks. A 30m backtest cannot replay the 10s watcher.
+
+## Phase 2 — dry-run (default)
+
+`~/.btst.env`:
+
+```
+BTST_LIVE_ORDERS=0
+BTST_LOTS=1
+BTST_LOT_SIZE=25
+BTST_MAX_PREMIUM=150
+BTST_LIMIT_SLIPPAGE_PTS=5
+```
+
+Telegram signals now include a `[DRY-RUN] ORDER INTENT` (NRML LIMIT, never MARKET). 1 lot cannot book 50% — the bot skips partial and keeps the HA exit on the full lot. Confirm `BTST_LOT_SIZE` on the live NIFTY contract.
+
+Do **not** set `BTST_LIVE_ORDERS=1`. Phase 3 (`placeOrder`) is not in this build.
+
 ## Limits
 
 - It never places an order. Every buy / partial / exit is you, by hand.
+- Dry-run (`BTST_LIVE_ORDERS=0`, the default) appends a `[DRY-RUN] ORDER INTENT` block so you can see the LIMIT NRML payload. `BTST_LIVE_ORDERS=1` is **refused** until Phase 3 exists — it will not call `placeOrder`.
 - It only tracks positions it opened. Manual trades are invisible.
 - Holidays are inferred from the feed, not a calendar. A lagging feed looks like a holiday — inside the entry window it now retries instead of giving up.
 - Silence outside 09:15–15:20 IST weekdays is normal. Run `selftest` to prove it’s alive.

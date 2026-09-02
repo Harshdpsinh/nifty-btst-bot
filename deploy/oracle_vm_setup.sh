@@ -171,6 +171,12 @@ ANGELONE_CLIENT_ID=
 ANGELONE_PASSWORD=
 ANGELONE_TOTP_SECRET=
 BTST_STATE_FILE=$STATE_FILE
+BTST_LIVE_ORDERS=0
+BTST_LOTS=1
+BTST_LOT_SIZE=25
+BTST_MAX_PREMIUM=150
+BTST_LIMIT_SLIPPAGE_PTS=5
+BTST_DAILY_MAX_ORDERS=4
 EOF
   chmod 600 "$ENV_FILE"
 else
@@ -179,6 +185,13 @@ else
     sed -i 's/^DATA_PROVIDER=yahoo/DATA_PROVIDER=angelone/' "$ENV_FILE"
     echo "==> Flipped DATA_PROVIDER yahoo -> angelone in $ENV_FILE (Yahoo was removed)"
   fi
+  # Phase 2 dry-run knobs — append only if missing, never overwrite secrets.
+  grep -q '^BTST_LIVE_ORDERS=' "$ENV_FILE" || echo 'BTST_LIVE_ORDERS=0' >> "$ENV_FILE"
+  grep -q '^BTST_LOTS=' "$ENV_FILE" || echo 'BTST_LOTS=1' >> "$ENV_FILE"
+  grep -q '^BTST_LOT_SIZE=' "$ENV_FILE" || echo 'BTST_LOT_SIZE=25' >> "$ENV_FILE"
+  grep -q '^BTST_MAX_PREMIUM=' "$ENV_FILE" || echo 'BTST_MAX_PREMIUM=150' >> "$ENV_FILE"
+  grep -q '^BTST_LIMIT_SLIPPAGE_PTS=' "$ENV_FILE" || echo 'BTST_LIMIT_SLIPPAGE_PTS=5' >> "$ENV_FILE"
+  grep -q '^BTST_DAILY_MAX_ORDERS=' "$ENV_FILE" || echo 'BTST_DAILY_MAX_ORDERS=4' >> "$ENV_FILE"
 fi
 
 mkdir -p "$APP_DIR/deploy"

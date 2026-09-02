@@ -108,6 +108,12 @@ if ! grep -q '^DATA_PROVIDER=' "$ENV_FILE"; then
   echo 'DATA_PROVIDER=angelone' >> "$ENV_FILE"
   echo "added DATA_PROVIDER=angelone"
 fi
+grep -q '^BTST_LIVE_ORDERS=' "$ENV_FILE" || { echo 'BTST_LIVE_ORDERS=0' >> "$ENV_FILE"; echo "added BTST_LIVE_ORDERS=0"; }
+grep -q '^BTST_LOTS=' "$ENV_FILE" || { echo 'BTST_LOTS=1' >> "$ENV_FILE"; echo "added BTST_LOTS=1"; }
+grep -q '^BTST_LOT_SIZE=' "$ENV_FILE" || { echo 'BTST_LOT_SIZE=25' >> "$ENV_FILE"; echo "added BTST_LOT_SIZE=25"; }
+grep -q '^BTST_MAX_PREMIUM=' "$ENV_FILE" || echo 'BTST_MAX_PREMIUM=150' >> "$ENV_FILE"
+grep -q '^BTST_LIMIT_SLIPPAGE_PTS=' "$ENV_FILE" || echo 'BTST_LIMIT_SLIPPAGE_PTS=5' >> "$ENV_FILE"
+grep -q '^BTST_DAILY_MAX_ORDERS=' "$ENV_FILE" || echo 'BTST_DAILY_MAX_ORDERS=4' >> "$ENV_FILE"
 grep '^DATA_PROVIDER=' "$ENV_FILE"
 grep -E '^(TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|ANGELONE_API_KEY|ANGELONE_CLIENT_ID|ANGELONE_PASSWORD|ANGELONE_TOTP_SECRET|BTST_STATE_FILE)=' "$ENV_FILE" \
   | sed 's/=.*/=SET/' || true
