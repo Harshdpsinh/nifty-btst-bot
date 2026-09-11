@@ -56,7 +56,8 @@ WEEKLY_EXPIRY_WEEKDAY = 1  # Tuesday
 ENTRY_ACTIONABLE_FROM = dt.time(15, 18)   # earliest a signal may be acted on
 ENTRY_LATE_LIMIT = dt.time(15, 28)        # after this the window has closed
 AUTO_ENTRY_UNTIL = dt.time(20, 0)         # still report a *missed* window until here
-EXIT_MONITOR_FROM = dt.time(9, 45)        # first 30m candle close — first level can arm
+EXIT_MONITOR_FROM = dt.time(9, 45)        # first 30m candle close — first HA level can arm
+OPEN_CANDLE_LAG_UNTIL = dt.time(10, 0)    # today's 09:15 bar often missing from API until then
 LEFTOVER_WATCH_FROM = dt.time(9, 15)      # leftover square-off can fire at the open
 EXIT_MONITOR_UNTIL = dt.time(15, 16)      # just past HARD_EXIT_TIME
 
@@ -92,6 +93,10 @@ _send_failures = 0
 
 class StaleDataError(RuntimeError):
     """Raised when the feed returns data too old to act on."""
+
+
+class CorruptStateError(RuntimeError):
+    """State file exists but is unreadable. Do NOT start fresh — that would drop a position."""
 
 
 def daily_divergence(spot: float, open_p: float, high_p: float, low_p: float) -> float:
@@ -302,8 +307,10 @@ def load_state() -> dict:
     try:
         data = json.loads(STATE_PATH.read_text())
     except (OSError, json.JSONDecodeError) as e:
-        log.warning("State file unreadable (%s) — starting fresh.", e)
-        return state
+        raise CorruptStateError(
+            f"State file {STATE_PATH} exists but is unreadable ({e}). "
+            f"Refusing to start fresh. Restore {STATE_PATH}.bak if present."
+        ) from e
     if isinstance(data, dict):
         state.update(data)
     return state
@@ -314,6 +321,9 @@ def save_state(state: dict) -> None:
     try:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+        if STATE_PATH.exists():
+            bak = STATE_PATH.with_name(STATE_PATH.name + ".bak")
+            bak.write_text(STATE_PATH.read_text())
         tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
         tmp.write_text(payload)
         os.replace(tmp, STATE_PATH)
@@ -417,6 +427,14 @@ def calculate_30m_heikin_ashi_day_and_prev(day: dt.date) -> tuple[pd.DataFrame, 
     full = _heikin_ashi(df)
     day_df = full[full.index.date == day]
     if day_df.empty:
+        # Angel One often omits today's 09:15 bar for 1–5 min after 09:45 close.
+        # Do not treat that open lag as a dead feed — HA refs stay empty, caller
+        # seeds the forming bucket from LTP so the 09:45 status can still go out.
+        now = _now()
+        if now.date() == day and now.time() < OPEN_CANDLE_LAG_UNTIL:
+            prev_row = full.iloc[-1] if len(full) else None
+            log.info("No 30m bar for %s yet (open lag) — seeding from prior session.", day)
+            return full.iloc[0:0], prev_row
         raise StaleDataError(f"No 30m candle data for {day} in the fetched window yet.")
 
     age_min = (_now() - _last_timestamp_ist(day_df)).total_seconds() / 60.0
@@ -684,6 +702,60 @@ def _try_clear_position(state: dict, message: str, intent: "execution.OrderInten
     return True
 
 
+def handle_partial_profit(state: dict, position: dict | None, now: dt.datetime | None = None) -> bool:
+    """2× option LTP from 09:15 on the exit session. Not gated on 30m HA candles."""
+    now = now or _now()
+    if not position:
+        return False
+    if position.get("partial_booked") or "symbol_token" not in position:
+        return False
+    if "entry_premium" not in position:
+        return False
+    if is_same_day_position(position, now.date()):
+        return False
+    if is_leftover_position(position, now.date()):
+        return False
+    if now.time() < LEFTOVER_WATCH_FROM:
+        return False
+    try:
+        ltp = PROVIDER.get_option_ltp(position["symbol_token"])
+    except Exception as e:
+        log.warning("Partial-profit LTP check failed (will retry next tick): %s", e)
+        return False
+    target = position["entry_premium"] * PARTIAL_PROFIT_MULTIPLIER
+    if ltp < target:
+        return False
+    intent = execution.make_partial_intent(position, ltp, now.date().isoformat())
+    lots_note = f"{PARTIAL_PROFIT_FRACTION * 100:.0f}%"
+    extra = ""
+    if now.time() < EXIT_MONITOR_FROM:
+        extra = (
+            "\n\n(2× is watched from 09:15 open using option LTP. "
+            "Does not wait for the 09:45 HA candle.)"
+        )
+    msg = f"""💰 PARTIAL PROFIT — BOOK {lots_note} NOW
+Time: {_stamp(now)}
+Contract: {position.get('tradingsymbol', position['side'])}
+
+Entry Premium: {position['entry_premium']:.2f}
+Current Premium: {ltp:.2f} ({PARTIAL_PROFIT_MULTIPLIER:.0f}x entry reached)
+
+⚡ ACTION REQUIRED: Book {lots_note} of your {position['side']} lots now.
+The remainder stays open — the full-exit rule keeps watching it unchanged.{extra}"""
+    if intent.skip_reason:
+        msg += f"\n\n⚠️ {intent.skip_reason}"
+    if not execution.submit(state, intent, send_telegram, msg):
+        log.error("Partial-profit alert UNDELIVERED — will retry next tick.")
+        return False
+    position["partial_booked"] = True
+    if intent.transaction == "SELL":
+        remaining = int(position.get("lots_remaining") or execution.configured_lots(position))
+        position["lots_remaining"] = max(0, remaining - intent.lots)
+    log.info("Partial profit handled: %s ltp=%.2f target=%.2f lots_sold=%s skip=%s",
+             position["side"], ltp, target, intent.lots, intent.skip_reason or "no")
+    return True
+
+
 def run_exit_scan(state: dict, force: bool = False) -> None:
     """30m HA exit + leftover + 15:13 cutoff. Cron path and watcher-down fallback."""
     now = _now()
@@ -699,6 +771,11 @@ def run_exit_scan(state: dict, force: bool = False) -> None:
                 and now.time() >= HARD_EXIT_TIME)):
             pass  # handle below even outside the 09:45–15:16 HA window
         elif not (EXIT_MONITOR_FROM <= now.time() < EXIT_MONITOR_UNTIL):
+            # 2× from 09:15 does not wait for HA candles. Stamp the exit session
+            # so a dead 09:15–09:45 feed still becomes leftover tomorrow.
+            if position and not is_same_day_position(position, today):
+                mark_exit_session(position, today)
+                handle_partial_profit(state, position, now)
             log.info("Outside 30m monitoring hours (%s) — nothing to do.", now_time)
             return
 
@@ -733,6 +810,9 @@ def run_exit_scan(state: dict, force: bool = False) -> None:
         )
         _try_clear_position(state, cutoff_message(position), intent)
         return
+
+    if position:
+        handle_partial_profit(state, position, now)
 
     try:
         ha_df = calculate_30m_heikin_ashi_for_day(today)
@@ -899,8 +979,9 @@ def run_auto(state: dict) -> None:
                 else:
                     log.error("Watcher-restored notice UNDELIVERED — flag kept, will retry.")
             return
-        # Watcher down: cron must cover HA exits or a live position is unwatched.
-        if t >= EXIT_MONITOR_FROM or leftover:
+        # Watcher down: cron must cover 2× from 09:15 and HA from 09:45.
+        overnight = bool(position) and not is_same_day_position(position, now.date())
+        if t >= EXIT_MONITOR_FROM or leftover or (overnight and t >= LEFTOVER_WATCH_FROM):
             today = now.date().isoformat()
             if state.get("watcher_down_alert_date") != today:
                 delivered = send_telegram(

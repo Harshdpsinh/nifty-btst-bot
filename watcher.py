@@ -89,10 +89,15 @@ def bootstrap(today: dt.date, now: dt.datetime) -> tuple[_CandleAccumulator, dic
     elif prev_session_row is not None:
         seed_open = float(prev_session_row["HA_Open"])
         seed_close = float(prev_session_row["HA_Close"])
-    else:
-        seed_row = forming_row if forming_row is not None else ha_df.iloc[-1]
+    elif forming_row is not None:
+        seed_open = (float(forming_row["Open"]) + float(forming_row["Close"])) / 2.0
+        seed_close = seed_open
+    elif ha_df is not None and len(ha_df) > 0:
+        seed_row = ha_df.iloc[-1]
         seed_open = (float(seed_row["Open"]) + float(seed_row["Close"])) / 2.0
         seed_close = seed_open
+    else:
+        seed_open = seed_close = 0.0
 
     if forming_row is not None:
         acc = _CandleAccumulator(
@@ -204,32 +209,7 @@ waiting for the candle to close.
 
 
 def _handle_partial_profit(state: dict, position: dict, now: dt.datetime) -> bool:
-    if position.get("partial_booked") or "symbol_token" not in position:
-        return False
-    if "entry_premium" not in position:
-        return False
-    try:
-        ltp = engine.PROVIDER.get_option_ltp(position["symbol_token"])
-    except Exception as e:
-        log.warning("Partial-profit LTP check failed (will retry next tick): %s", e)
-        return False
-    target = position["entry_premium"] * engine.PARTIAL_PROFIT_MULTIPLIER
-    if ltp >= target:
-        intent = execution.make_partial_intent(position, ltp, now.date().isoformat())
-        msg = _partial_profit_message(position, ltp, engine._stamp(now))
-        if intent.skip_reason:
-            msg += f"\n\n⚠️ {intent.skip_reason}"
-        if not execution.submit(state, intent, engine.send_telegram, msg):
-            log.error("Partial-profit alert UNDELIVERED — will retry next tick.")
-            return False
-        position["partial_booked"] = True
-        if intent.transaction == "SELL":
-            remaining = int(position.get("lots_remaining") or execution.configured_lots(position))
-            position["lots_remaining"] = max(0, remaining - intent.lots)
-        log.info("Partial profit handled: %s ltp=%.2f target=%.2f lots_sold=%s skip=%s",
-                 position["side"], ltp, target, intent.lots, intent.skip_reason or "no")
-        return True
-    return False
+    return engine.handle_partial_profit(state, position, now)
 
 
 def _handle_full_exit(state: dict, position: dict, acc: _CandleAccumulator, refs: dict,
@@ -347,20 +327,44 @@ def _touch_heartbeat(state: dict, now: dt.datetime) -> None:
     state["watcher_heartbeat"] = now.isoformat()
 
 
+def _maybe_send_status(state: dict, acc: _CandleAccumulator | None, refs: dict | None,
+                        position: dict | None, now: dt.datetime) -> None:
+    """Send the 30m status once per bucket. Retries if LTP/live HA was missing at rollover."""
+    if acc is None:
+        return
+    live = acc.live_ha()
+    if live is None:
+        return
+    bucket_key = acc.bucket_start.isoformat()
+    if state.get("watcher_last_status_bucket") == bucket_key:
+        return
+    if not (position or engine.STATUS_WHEN_FLAT):
+        return
+    ha_open, ha_close, ha_high, ha_low = live
+    if engine.send_telegram(_status_message(
+            now.strftime("%H:%M IST"), position, ha_open, ha_close, ha_high, ha_low,
+            acc.close if acc.close is not None else 0.0,
+            refs or {"red": None, "green": None})):
+        state["watcher_last_status_bucket"] = bucket_key
+    else:
+        log.error("Status update UNDELIVERED — will retry next tick.")
+
+
 def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
                    health: _HealthTracker) -> tuple[_CandleAccumulator | None, dict | None]:
     now = engine._now()
     today = now.date()
 
     with engine.locked_state() as state:
-        _touch_heartbeat(state, now)
         position = state.get("position")
 
         if position and _leftover_exit(state, position, now):
+            _touch_heartbeat(state, now)
             return acc, refs
 
         if position and engine.is_same_day_position(position, today):
             log.info("Same-day position — overnight hold, watcher not exiting.")
+            _touch_heartbeat(state, now)
             return acc, refs
 
         # Today is this position's one exit session. Stamp it now, before the
@@ -371,9 +375,15 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
             engine.mark_exit_session(position, today)
 
         if position and _hard_cutoff(state, position, now):
+            _touch_heartbeat(state, now)
             return acc, refs
 
+        # 2× from 09:15 using option LTP only — do not wait for 09:45 HA.
+        if position and now.time() >= engine.LEFTOVER_WATCH_FROM:
+            _handle_partial_profit(state, position, now)
+
         if now.time() < engine.EXIT_MONITOR_FROM:
+            _touch_heartbeat(state, now)
             return acc, refs
 
         current_bucket = engine.nse_30m_bucket_start(now)
@@ -387,7 +397,7 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
             try:
                 acc, refs = bootstrap(today, now)
             except engine.StaleDataError as e:
-                log.warning("Bootstrap skipped (backing off): %s", e)
+                log.warning("Bootstrap skipped (backing off, heartbeat FROZEN so cron covers): %s", e)
                 health.next_bootstrap_at = now + dt.timedelta(
                     seconds=BOOTSTRAP_BACKOFF_SECONDS[0])
                 return acc, refs
@@ -395,25 +405,15 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
                 idx = min(health.consecutive_failures, len(BOOTSTRAP_BACKOFF_SECONDS) - 1)
                 delay = BOOTSTRAP_BACKOFF_SECONDS[idx]
                 health.next_bootstrap_at = now + dt.timedelta(seconds=delay)
-                log.warning("Bootstrap failed (retrying in %ds): %s", delay, e)
+                log.warning("Bootstrap failed (retrying in %ds, heartbeat FROZEN): %s", delay, e)
                 _record_failure(health, f"Bootstrap: {type(e).__name__}: {e}", now)
                 return acc, refs
             _record_success(health, now)
 
-            bucket_key = acc.bucket_start.isoformat()
-            live = acc.live_ha()
-            if (live is not None
-                    and state.get("watcher_last_status_bucket") != bucket_key
-                    and (position or engine.STATUS_WHEN_FLAT)):
-                ha_open, ha_close, ha_high, ha_low = live
-                if engine.send_telegram(_status_message(
-                        now.strftime("%H:%M IST"), position, ha_open, ha_close, ha_high, ha_low,
-                        acc.close if acc.close is not None else 0.0, refs)):
-                    state["watcher_last_status_bucket"] = bucket_key
-                else:
-                    log.error("Status update UNDELIVERED — will retry next tick.")
+        _maybe_send_status(state, acc, refs, position, now)
 
         if not position:
+            _touch_heartbeat(state, now)
             return acc, refs
 
         if acc is None:
@@ -422,7 +422,7 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
         try:
             ltp = engine.PROVIDER.get_index_ltp()
         except Exception as e:
-            log.warning("Index LTP tick failed (will retry next tick): %s", e)
+            log.warning("Index LTP tick failed (heartbeat FROZEN so cron covers): %s", e)
             _record_failure(health, f"Index LTP: {type(e).__name__}: {e}", now)
             return acc, refs
         _record_success(health, now)
@@ -430,6 +430,7 @@ def _run_one_tick(acc: _CandleAccumulator | None, refs: dict | None,
 
         _handle_partial_profit(state, position, now)
         _handle_full_exit(state, position, acc, refs, now)
+        _touch_heartbeat(state, now)
 
     return acc, refs
 
@@ -463,9 +464,9 @@ def main() -> int:
         now = engine._now()
         with engine.locked_state() as peek:
             stay = _should_stay_awake(now, peek)
-            # Heartbeat even while deciding, so cron knows we're alive during hours.
-            if stay:
-                peek["watcher_heartbeat"] = now.isoformat()
+            # Do NOT write watcher_heartbeat here. A living process with a
+            # dead feed used to look "fresh" to cron, so neither side exited.
+            # Heartbeat is only touched after leftover/cutoff/partial or a successful LTP tick.
 
         if not (_capable() and stay):
             acc = None
