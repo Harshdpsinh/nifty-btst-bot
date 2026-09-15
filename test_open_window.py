@@ -217,10 +217,11 @@ class CorruptStateTests(unittest.TestCase):
 
 
 class StatusMessageTests(unittest.TestCase):
-    def test_status_separates_closed_green_from_live_red(self):
+    def test_status_shows_closed_green_not_forming_red(self):
         idx = pd.DatetimeIndex([_ts(9, 15)])
         closed = pd.DataFrame(
             {
+                "Open": [23300.0], "High": [23592.85], "Low": [23280.0], "Close": [23490.0],
                 "HA_Open": [23300.0], "HA_Close": [23500.0],
                 "HA_High": [23592.85], "HA_Low": [23280.0],
                 "Is_Red": [False], "Is_Green": [True],
@@ -228,16 +229,52 @@ class StatusMessageTests(unittest.TestCase):
             index=idx,
         ).iloc[-1]
         refs = {"red": None, "green": closed, "_closed_last": closed}
-        msg = watcher._status_message(
-            "09:45 IST", None,
-            ha_open=23458.44, ha_close=23442.29,
-            ha_high=23458.44, ha_low=23434.35,
-            close=23438.90, refs=refs,
-            bucket_start=_ts(9, 45),
-        )
-        self.assertIn("Last CLOSED 30m (09:15): 🟢 GREEN", msg)
-        self.assertIn("LIVE forming 30m (09:45–now): 🔴 RED", msg)
+        msg = watcher._status_message("09:45 IST", None, closed, refs)
+        self.assertIn("CLOSED 30M HEIKIN-ASHI (09:15–09:45)", msg)
+        self.assertIn("HA Candle Color: 🟢 GREEN", msg)
         self.assertIn("23592.85", msg)
+        self.assertNotIn("LIVE forming", msg)
+        self.assertNotIn("🔴 RED", msg)
+
+    def test_status_waits_when_closed_bar_missing(self):
+        acc = watcher._CandleAccumulator(
+            bucket_start=_ts(9, 45),
+            open=23440.0, high=23440.0, low=23440.0, close=23440.0,
+            prev_ha_open=23458.0, prev_ha_close=23442.0,
+        )
+        state = {"position": None}
+        sent = []
+        with mock.patch.object(engine, "send_telegram", side_effect=lambda m: sent.append(m) or True), \
+             mock.patch.object(engine, "STATUS_WHEN_FLAT", True):
+            watcher._maybe_send_status(state, acc, {"red": None, "green": None}, None, _ts(9, 45))
+        self.assertEqual(sent, [])
+        self.assertNotIn("watcher_last_status_bucket", state)
+
+    def test_status_sends_when_closed_bar_matches_previous_bucket(self):
+        idx = pd.DatetimeIndex([_ts(9, 15)])
+        closed = pd.DataFrame(
+            {
+                "Close": [23490.0],
+                "HA_Open": [23300.0], "HA_Close": [23500.0],
+                "HA_High": [23592.85], "HA_Low": [23280.0],
+            },
+            index=idx,
+        ).iloc[-1]
+        acc = watcher._CandleAccumulator(
+            bucket_start=_ts(9, 45),
+            open=23440.0, high=23440.0, low=23440.0, close=23440.0,
+            prev_ha_open=23500.0, prev_ha_close=23500.0,
+        )
+        refs = {"red": None, "green": closed, "_closed_last": closed}
+        state = {"position": None}
+        sent = []
+        with mock.patch.object(engine, "send_telegram", side_effect=lambda m: sent.append(m) or True), \
+             mock.patch.object(engine, "STATUS_WHEN_FLAT", True):
+            watcher._maybe_send_status(state, acc, refs, None, _ts(9, 45))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("🟢 GREEN", sent[0])
+        self.assertIn("CLOSED 30M HEIKIN-ASHI (09:15–09:45)", sent[0])
+        self.assertNotIn("LIVE forming", sent[0])
 
 
 if __name__ == "__main__":

@@ -130,24 +130,24 @@ def _ha_color(ha_open: float, ha_close: float) -> str:
     return "⚪ FLAT"
 
 
-def _status_message(now_time: str, position: dict | None, ha_open: float, ha_close: float,
-                     ha_high: float, ha_low: float, close: float, refs: dict,
-                     bucket_start: dt.datetime | None = None) -> str:
-    live_color = _ha_color(ha_open, ha_close)
-    closed = (refs or {}).get("_closed_last")
-    if closed is not None:
-        ct = closed.name.strftime("%H:%M")
-        closed_color = _ha_color(float(closed["HA_Open"]), float(closed["HA_Close"]))
-        closed_block = (
-            f"• Last CLOSED 30m ({ct}): {closed_color}\n"
-            f"  HA_O {float(closed['HA_Open']):.2f}  HA_C {float(closed['HA_Close']):.2f}  "
-            f"HA_H {float(closed['HA_High']):.2f}  HA_L {float(closed['HA_Low']):.2f}\n"
-            f"  ← TradingView ka bada completed candle. Isi se color compare karo."
-        )
-    else:
-        closed_block = "• Last CLOSED 30m: none yet today (first bar still forming)"
+def _bar_start(ts) -> dt.datetime:
+    t = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+    if getattr(t, "tzinfo", None) is not None:
+        t = t.astimezone(engine.IST).replace(tzinfo=None)
+    return t.replace(second=0, microsecond=0)
 
-    bkt = bucket_start.strftime("%H:%M") if bucket_start is not None else "live"
+
+def _status_message(now_time: str, position: dict | None, closed, refs: dict) -> str:
+    """Closed 30m HA only — never the forming bar."""
+    ha_open = float(closed["HA_Open"])
+    ha_close = float(closed["HA_Close"])
+    ha_high = float(closed["HA_High"])
+    ha_low = float(closed["HA_Low"])
+    spot = float(closed["Close"])
+    start = _bar_start(closed.name)
+    end = start + dt.timedelta(minutes=30)
+    candle_color = _ha_color(ha_open, ha_close)
+
     ref_lines = []
     if refs.get("red") is not None:
         ref_lines.append(
@@ -180,14 +180,15 @@ Asset: NIFTY 50 (Spot)
 
 {pos_line}
 
-📊 30M HEIKIN-ASHI — two candles (do not mix)
+📊 CLOSED 30M HEIKIN-ASHI ({start.strftime('%H:%M')}–{end.strftime('%H:%M')})
+• Standard Spot Close: {spot:.2f}
+• HA Candle Color: {candle_color}
+• HA Open: {ha_open:.2f}
+• HA Close: {ha_close:.2f}
+• HA High: {ha_high:.2f}
+• HA Low: {ha_low:.2f}
 
-{closed_block}
-
-• LIVE forming 30m ({bkt}–now): {live_color}
-  Spot {close:.2f}  HA_O {ha_open:.2f}  HA_C {ha_close:.2f}
-  HA_H {ha_high:.2f}  HA_L {ha_low:.2f}
-  ← naya bar, TV pe chhota naya candle. Pichhli green/red se color mat milao.
+(Forming candle is not shown. This is the last completed 30m bar.)
 
 📉 REFERENCE EXIT LEVEL(S) — today only
 {ref_block}
@@ -349,24 +350,30 @@ def _touch_heartbeat(state: dict, now: dt.datetime) -> None:
 
 def _maybe_send_status(state: dict, acc: _CandleAccumulator | None, refs: dict | None,
                         position: dict | None, now: dt.datetime) -> None:
-    """Send the 30m status once per bucket. Retries if LTP/live HA was missing at rollover."""
+    """Send status for the last CLOSED 30m bar only. Wait if that bar is not in yet."""
     if acc is None:
         return
-    live = acc.live_ha()
-    if live is None:
+    refs = refs or {}
+    closed = refs.get("_closed_last")
+    if closed is None:
+        log.info("Status waiting — no closed 30m HA bar yet.")
         return
-    bucket_key = acc.bucket_start.isoformat()
-    if state.get("watcher_last_status_bucket") == bucket_key:
+    prev_bucket = acc.bucket_start - dt.timedelta(minutes=30)
+    if _bar_start(closed.name) != _bar_start(prev_bucket):
+        log.info(
+            "Status waiting for closed %s (have %s).",
+            prev_bucket.strftime("%H:%M"),
+            _bar_start(closed.name).strftime("%H:%M"),
+        )
+        return
+    closed_key = _bar_start(closed.name).isoformat()
+    if state.get("watcher_last_status_bucket") == closed_key:
         return
     if not (position or engine.STATUS_WHEN_FLAT):
         return
-    ha_open, ha_close, ha_high, ha_low = live
     if engine.send_telegram(_status_message(
-            now.strftime("%H:%M IST"), position, ha_open, ha_close, ha_high, ha_low,
-            acc.close if acc.close is not None else 0.0,
-            refs or {"red": None, "green": None},
-            bucket_start=acc.bucket_start)):
-        state["watcher_last_status_bucket"] = bucket_key
+            now.strftime("%H:%M IST"), position, closed, refs)):
+        state["watcher_last_status_bucket"] = closed_key
     else:
         log.error("Status update UNDELIVERED — will retry next tick.")
 

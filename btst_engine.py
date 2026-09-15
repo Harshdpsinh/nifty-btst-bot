@@ -836,13 +836,6 @@ def run_exit_scan(state: dict, force: bool = False) -> None:
     candle_key = str(latest.name)
     ref_red, ref_green = sticky_refs(closed)
 
-    if latest["Is_Red"]:
-        candle_color = "🔴 RED"
-    elif latest["Is_Green"]:
-        candle_color = "🟢 GREEN"
-    else:
-        candle_color = "⚪ FLAT"
-
     already_signalled = state.get("last_exit_signal_candle") == candle_key
     if position and not already_signalled:
         side = position["side"]
@@ -890,12 +883,30 @@ Reason: Latest green 30m HA High (today) broken by current HA High
                 log.error("PE EXIT UNDELIVERED — position kept.")
                 return
 
-    if not force and state.get("last_status_candle") == candle_key:
-        log.info("Status for candle %s already sent — skipping duplicate.", candle_key)
+    if len(closed) == 0:
+        log.info("Status waiting — no closed 30m HA bar yet.")
+        return
+    status_row = closed.iloc[-1]
+    status_key = str(status_row.name)
+    if status_row["Is_Red"]:
+        candle_color = "🔴 RED"
+    elif status_row["Is_Green"]:
+        candle_color = "🟢 GREEN"
+    else:
+        candle_color = "⚪ FLAT"
+    bar_start = status_row.name
+    if hasattr(bar_start, "to_pydatetime"):
+        bar_start = bar_start.to_pydatetime()
+    if getattr(bar_start, "tzinfo", None) is not None:
+        bar_start = bar_start.astimezone(IST).replace(tzinfo=None)
+    bar_end = bar_start + dt.timedelta(minutes=30)
+
+    if not force and state.get("last_status_candle") == status_key:
+        log.info("Status for closed candle %s already sent — skipping duplicate.", status_key)
         return
     if not position and not STATUS_WHEN_FLAT:
         log.info("Flat and STATUS_WHEN_FLAT disabled — skipping status update.")
-        state["last_status_candle"] = candle_key
+        state["last_status_candle"] = status_key
         return
 
     ref_lines = []
@@ -927,20 +938,22 @@ Asset: NIFTY 50 (Spot)
 
 {pos_line}
 
-📊 LATEST 30M HEIKIN-ASHI DATA
-• Standard Spot Close: {latest['Close']:.2f}
+📊 CLOSED 30M HEIKIN-ASHI ({bar_start.strftime('%H:%M')}–{bar_end.strftime('%H:%M')})
+• Standard Spot Close: {status_row['Close']:.2f}
 • HA Candle Color: {candle_color}
-• Current HA Open: {latest['HA_Open']:.2f}
-• Current HA Close: {latest['HA_Close']:.2f}
-• Current HA High: {latest['HA_High']:.2f}
-• Current HA Low: {latest['HA_Low']:.2f}
+• HA Open: {status_row['HA_Open']:.2f}
+• HA Close: {status_row['HA_Close']:.2f}
+• HA High: {status_row['HA_High']:.2f}
+• HA Low: {status_row['HA_Low']:.2f}
+
+(Forming candle is not shown. This is the last completed 30m bar.)
 
 📉 REFERENCE EXIT LEVEL(S) — today only
 {ref_block}
 
 ℹ️ System Active."""
     if send_telegram(status):
-        state["last_status_candle"] = candle_key
+        state["last_status_candle"] = status_key
     else:
         log.error("Status update UNDELIVERED — will retry.")
 
