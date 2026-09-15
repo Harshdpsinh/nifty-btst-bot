@@ -78,10 +78,12 @@ def bootstrap(today: dt.date, now: dt.datetime) -> tuple[_CandleAccumulator, dic
     current_bucket = engine.nse_30m_bucket_start(now)
     closed, forming_row = engine.split_closed_and_forming(ha_df, now)
 
-    refs: dict = {"red": None, "green": None}
+    refs: dict = {"red": None, "green": None, "_closed_last": None}
     ref_red, ref_green = engine.sticky_refs(closed)
     refs["red"] = ref_red
     refs["green"] = ref_green
+    if len(closed) > 0:
+        refs["_closed_last"] = closed.iloc[-1]
 
     if len(closed) > 0:
         seed_open = float(closed.iloc[-1]["HA_Open"])
@@ -120,22 +122,39 @@ def bootstrap(today: dt.date, now: dt.datetime) -> tuple[_CandleAccumulator, dic
     return acc, refs
 
 
-def _status_message(now_time: str, position: dict | None, ha_open: float, ha_close: float,
-                     ha_high: float, ha_low: float, close: float, refs: dict) -> str:
+def _ha_color(ha_open: float, ha_close: float) -> str:
     if ha_close < ha_open:
-        candle_color = "🔴 RED"
-    elif ha_close > ha_open:
-        candle_color = "🟢 GREEN"
-    else:
-        candle_color = "⚪ FLAT"
+        return "🔴 RED"
+    if ha_close > ha_open:
+        return "🟢 GREEN"
+    return "⚪ FLAT"
 
+
+def _status_message(now_time: str, position: dict | None, ha_open: float, ha_close: float,
+                     ha_high: float, ha_low: float, close: float, refs: dict,
+                     bucket_start: dt.datetime | None = None) -> str:
+    live_color = _ha_color(ha_open, ha_close)
+    closed = (refs or {}).get("_closed_last")
+    if closed is not None:
+        ct = closed.name.strftime("%H:%M")
+        closed_color = _ha_color(float(closed["HA_Open"]), float(closed["HA_Close"]))
+        closed_block = (
+            f"• Last CLOSED 30m ({ct}): {closed_color}\n"
+            f"  HA_O {float(closed['HA_Open']):.2f}  HA_C {float(closed['HA_Close']):.2f}  "
+            f"HA_H {float(closed['HA_High']):.2f}  HA_L {float(closed['HA_Low']):.2f}\n"
+            f"  ← TradingView ka bada completed candle. Isi se color compare karo."
+        )
+    else:
+        closed_block = "• Last CLOSED 30m: none yet today (first bar still forming)"
+
+    bkt = bucket_start.strftime("%H:%M") if bucket_start is not None else "live"
     ref_lines = []
-    if refs["red"] is not None:
+    if refs.get("red") is not None:
         ref_lines.append(
             f"• ARMED (CE exit): latest red HA Low "
             f"({refs['red'].name.strftime('%H:%M')}) {refs['red']['HA_Low']:.2f}"
         )
-    if refs["green"] is not None:
+    if refs.get("green") is not None:
         ref_lines.append(
             f"• ARMED (PE exit): latest green HA High "
             f"({refs['green'].name.strftime('%H:%M')}) {refs['green']['HA_High']:.2f}"
@@ -161,13 +180,14 @@ Asset: NIFTY 50 (Spot)
 
 {pos_line}
 
-📊 LATEST 30M HEIKIN-ASHI DATA
-• Standard Spot Close: {close:.2f}
-• HA Candle Color: {candle_color}
-• Current HA Open: {ha_open:.2f}
-• Current HA Close: {ha_close:.2f}
-• Current HA High: {ha_high:.2f}
-• Current HA Low: {ha_low:.2f}
+📊 30M HEIKIN-ASHI — two candles (do not mix)
+
+{closed_block}
+
+• LIVE forming 30m ({bkt}–now): {live_color}
+  Spot {close:.2f}  HA_O {ha_open:.2f}  HA_C {ha_close:.2f}
+  HA_H {ha_high:.2f}  HA_L {ha_low:.2f}
+  ← naya bar, TV pe chhota naya candle. Pichhli green/red se color mat milao.
 
 📉 REFERENCE EXIT LEVEL(S) — today only
 {ref_block}
@@ -344,7 +364,8 @@ def _maybe_send_status(state: dict, acc: _CandleAccumulator | None, refs: dict |
     if engine.send_telegram(_status_message(
             now.strftime("%H:%M IST"), position, ha_open, ha_close, ha_high, ha_low,
             acc.close if acc.close is not None else 0.0,
-            refs or {"red": None, "green": None})):
+            refs or {"red": None, "green": None},
+            bucket_start=acc.bucket_start)):
         state["watcher_last_status_bucket"] = bucket_key
     else:
         log.error("Status update UNDELIVERED — will retry next tick.")

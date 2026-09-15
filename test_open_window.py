@@ -216,5 +216,29 @@ class CorruptStateTests(unittest.TestCase):
                     engine.load_state()
 
 
+class StatusMessageTests(unittest.TestCase):
+    def test_status_separates_closed_green_from_live_red(self):
+        idx = pd.DatetimeIndex([_ts(9, 15)])
+        closed = pd.DataFrame(
+            {
+                "HA_Open": [23300.0], "HA_Close": [23500.0],
+                "HA_High": [23592.85], "HA_Low": [23280.0],
+                "Is_Red": [False], "Is_Green": [True],
+            },
+            index=idx,
+        ).iloc[-1]
+        refs = {"red": None, "green": closed, "_closed_last": closed}
+        msg = watcher._status_message(
+            "09:45 IST", None,
+            ha_open=23458.44, ha_close=23442.29,
+            ha_high=23458.44, ha_low=23434.35,
+            close=23438.90, refs=refs,
+            bucket_start=_ts(9, 45),
+        )
+        self.assertIn("Last CLOSED 30m (09:15): 🟢 GREEN", msg)
+        self.assertIn("LIVE forming 30m (09:45–now): 🔴 RED", msg)
+        self.assertIn("23592.85", msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
