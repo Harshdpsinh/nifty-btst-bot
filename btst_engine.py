@@ -939,14 +939,13 @@ Asset: NIFTY 50 (Spot)
 {pos_line}
 
 📊 CLOSED 30M HEIKIN-ASHI ({bar_start.strftime('%H:%M')}–{bar_end.strftime('%H:%M')})
-• Standard Spot Close: {status_row['Close']:.2f}
-• HA Candle Color: {candle_color}
-• HA Open: {status_row['HA_Open']:.2f}
-• HA Close: {status_row['HA_Close']:.2f}
-• HA High: {status_row['HA_High']:.2f}
-• HA Low: {status_row['HA_Low']:.2f}
+• Color: {candle_color}
+• Open: {status_row['HA_Open']:.2f}
+• High: {status_row['HA_High']:.2f}
+• Low: {status_row['HA_Low']:.2f}
+• Close: {status_row['HA_Close']:.2f}
 
-(Forming candle is not shown. This is the last completed 30m bar.)
+(Completed Angel One 30m HA only — same candle as TradingView.)
 
 📉 REFERENCE EXIT LEVEL(S) — today only
 {ref_block}

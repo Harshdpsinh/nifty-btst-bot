@@ -143,7 +143,6 @@ def _status_message(now_time: str, position: dict | None, closed, refs: dict) ->
     ha_close = float(closed["HA_Close"])
     ha_high = float(closed["HA_High"])
     ha_low = float(closed["HA_Low"])
-    spot = float(closed["Close"])
     start = _bar_start(closed.name)
     end = start + dt.timedelta(minutes=30)
     candle_color = _ha_color(ha_open, ha_close)
@@ -181,14 +180,13 @@ Asset: NIFTY 50 (Spot)
 {pos_line}
 
 📊 CLOSED 30M HEIKIN-ASHI ({start.strftime('%H:%M')}–{end.strftime('%H:%M')})
-• Standard Spot Close: {spot:.2f}
-• HA Candle Color: {candle_color}
-• HA Open: {ha_open:.2f}
-• HA Close: {ha_close:.2f}
-• HA High: {ha_high:.2f}
-• HA Low: {ha_low:.2f}
+• Color: {candle_color}
+• Open: {ha_open:.2f}
+• High: {ha_high:.2f}
+• Low: {ha_low:.2f}
+• Close: {ha_close:.2f}
 
-(Forming candle is not shown. This is the last completed 30m bar.)
+(Completed Angel One 30m HA only — same candle as TradingView.)
 
 📉 REFERENCE EXIT LEVEL(S) — today only
 {ref_block}

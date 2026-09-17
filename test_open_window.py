@@ -231,7 +231,11 @@ class StatusMessageTests(unittest.TestCase):
         refs = {"red": None, "green": closed, "_closed_last": closed}
         msg = watcher._status_message("09:45 IST", None, closed, refs)
         self.assertIn("CLOSED 30M HEIKIN-ASHI (09:15–09:45)", msg)
-        self.assertIn("HA Candle Color: 🟢 GREEN", msg)
+        self.assertIn("Color: 🟢 GREEN", msg)
+        self.assertIn("Open: 23300.00", msg)
+        self.assertIn("High: 23592.85", msg)
+        self.assertIn("Low: 23280.00", msg)
+        self.assertIn("Close: 23500.00", msg)
         self.assertIn("23592.85", msg)
         self.assertNotIn("LIVE forming", msg)
         self.assertNotIn("🔴 RED", msg)
